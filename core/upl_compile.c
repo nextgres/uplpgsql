@@ -39,6 +39,20 @@
 
 #include "miscadmin.h"
 
+/*
+ * Symbol name the JIT emits for sigsetjmp (called directly from the compiled
+ * function's frame, so it cannot be wrapped).  glibc exposes sigsetjmp only as
+ * a macro over __sigsetjmp, so there is no "sigsetjmp" symbol for OrcJIT's
+ * process-symbol search (dlsym) to resolve — a compiled function containing an
+ * EXCEPTION handler would fail to materialize.  Emit __sigsetjmp there.  On
+ * macOS/BSD and musl, sigsetjmp is a real symbol.
+ */
+#ifdef __GLIBC__
+#define UPL_SIGSETJMP_SYM	"__sigsetjmp"
+#else
+#define UPL_SIGSETJMP_SYM	"sigsetjmp"
+#endif
+
 /* Generation counter for unique LLVM symbol names across recompilations */
 static uint64 compile_gen = 0;
 
@@ -863,7 +877,7 @@ upl_compile_function(UPL_compile_ctx *ctx, UPL_compile_hooks *hooks)
 			LLVMAttributeRef attr;
 
 			ctx->sigsetjmp_fntype = sjft;
-			sjfn = LLVMAddFunction(ctx->module, "sigsetjmp", sjft);
+			sjfn = LLVMAddFunction(ctx->module, UPL_SIGSETJMP_SYM, sjft);
 			ctx->sigsetjmp_fn = sjfn;
 
 			/* Mark as returns_twice -- critical for correct codegen */
