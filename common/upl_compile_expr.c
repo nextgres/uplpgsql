@@ -70,6 +70,8 @@
  */
 #include "upl_common.h"
 
+#include "utils/datum.h"		/* datumCopy */
+
 /*
  * Convenience macros for accessing PL/pgSQL-specific lang_data fields.
  */
@@ -2477,7 +2479,36 @@ fmgr_load_arg_datum(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 				if (c->constisnull)
 					return LLVMConstInt(i64, 0, false);
 
-				/* Embed the Datum value as an i64 constant */
+				/*
+				 * Embed the Datum value as an i64 constant.
+				 *
+				 * For a pass-by-reference constant (text, numeric, ...) the
+				 * Datum is a pointer into the cached plan's tree.  Embedding
+				 * it raw freezes that pointer into the compiled code, which
+				 * outlives any particular plan: the JIT cache invalidates on
+				 * fn_xmin/fn_tid (the pg_proc row), so a plan discarded and
+				 * rebuilt for an unrelated reason — a revalidation after DDL,
+				 * say — would leave the compiled code pointing at freed
+				 * memory.  Copy it somewhere that lasts as long as the code
+				 * does instead.
+				 *
+				 * TopMemoryContext matches the lifetime of the compiled code,
+				 * which is never released (LLJIT has no cheap per-function
+				 * removal), so this is the same deliberate trade the code
+				 * itself makes rather than a new leak.
+				 */
+				if (!c->constbyval)
+				{
+					MemoryContext	oldcxt;
+					Datum			persistent;
+
+					oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+					persistent = datumCopy(c->constvalue, false, c->constlen);
+					MemoryContextSwitchTo(oldcxt);
+
+					return LLVMConstInt(i64, (uint64) persistent, false);
+				}
+
 				return LLVMConstInt(i64, (uint64) c->constvalue, false);
 			}
 
@@ -2810,6 +2841,21 @@ uplpgsql_compile_expr_fmgr_full(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 				{
 					FmgrInfo   *persistent_finfo;
 
+					/*
+					 * The compiled code holds a raw pointer to this FmgrInfo
+					 * for as long as it exists, so it must outlive any
+					 * compilation context — hence TopMemoryContext, and hence
+					 * never freed.
+					 *
+					 * That is deliberate, not an oversight: the JIT'd code
+					 * itself is intentionally leaked on recompile (LLJIT has
+					 * no cheap per-function removal, and an in-flight call may
+					 * still be executing the old code), so freeing the FmgrInfo
+					 * on recompile would reintroduce exactly the
+					 * use-after-free that leaking the code avoids.  The
+					 * FmgrInfo is a few dozen bytes against the kilobytes of
+					 * machine code it accompanies.
+					 */
 					persistent_finfo = (FmgrInfo *)
 						MemoryContextAllocZero(TopMemoryContext,
 											   sizeof(FmgrInfo));
