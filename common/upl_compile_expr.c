@@ -1133,7 +1133,25 @@ emit_int_divmod(UPLpgSQL_compile_ctx *ctx,
 	}
 	else
 	{
-		result = LLVMBuildSRem(builder, lhs, rhs, "mod.result");
+		/*
+		 * SREM traps (SIGFPE) on INT_MIN % -1 because the implied quotient
+		 * overflows, even though the mathematical remainder is 0.  PostgreSQL's
+		 * int4mod/int8mod special-case a divisor of -1 and return 0.  Avoid the
+		 * trap without a branch: take the remainder against a divisor that is
+		 * never -1 (SREM by 1 is always 0 and never traps), then select 0 when
+		 * the real divisor was -1.
+		 */
+		LLVMValueRef	is_neg1,
+						safe_rhs,
+						rem;
+
+		is_neg1 = LLVMBuildICmp(builder, LLVMIntEQ, rhs,
+			LLVMConstInt(int_type, (uint64) -1, true), "mod.isneg1");
+		safe_rhs = LLVMBuildSelect(builder, is_neg1,
+			LLVMConstInt(int_type, 1, false), rhs, "mod.safe.rhs");
+		rem = LLVMBuildSRem(builder, lhs, safe_rhs, "mod.result");
+		result = LLVMBuildSelect(builder, is_neg1,
+			LLVMConstInt(int_type, 0, false), rem, "mod.val");
 	}
 
 	{
