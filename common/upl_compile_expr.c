@@ -1206,6 +1206,71 @@ emit_int_abs(UPLpgSQL_compile_ctx *ctx, LLVMValueRef arg,
 	return LLVMBuildSelect(builder, cmp, arg, neg, "abs.val");
 }
 
+/*
+ * Emit a float8 comparison with PostgreSQL's NaN semantics (i1 result).
+ *
+ * PostgreSQL orders float8 via float8_cmp_internal: NaN equals NaN and is
+ * greater than every non-NaN value.  Plain ordered LLVM predicates instead
+ * treat every NaN comparison as false, so 'NaN' = 'NaN' and 'NaN' > 1 would
+ * come out false here while SQL returns true.  Fold the NaN cases in
+ * explicitly (isnan(x) == unordered(x, x)).
+ */
+static LLVMValueRef
+emit_float8_cmp(UPLpgSQL_compile_ctx *ctx, Oid fid,
+				LLVMValueRef lhs, LLVMValueRef rhs)
+{
+	LLVMBuilderRef	builder = ctx->builder;
+	LLVMValueRef	na, nb, ord, eq;
+
+	na = LLVMBuildFCmp(builder, LLVMRealUNO, lhs, lhs, "f8.lhs.nan");
+	nb = LLVMBuildFCmp(builder, LLVMRealUNO, rhs, rhs, "f8.rhs.nan");
+
+	switch (fid)
+	{
+		case F_FLOAT8EQ:
+			ord = LLVMBuildFCmp(builder, LLVMRealOEQ, lhs, rhs, "f8.oeq");
+			return LLVMBuildOr(builder, ord,
+							   LLVMBuildAnd(builder, na, nb, "f8.bothnan"),
+							   "f8.eq");
+		case F_FLOAT8NE:
+			ord = LLVMBuildFCmp(builder, LLVMRealOEQ, lhs, rhs, "f8.oeq");
+			eq = LLVMBuildOr(builder, ord,
+							 LLVMBuildAnd(builder, na, nb, "f8.bothnan"),
+							 "f8.eq");
+			return LLVMBuildNot(builder, eq, "f8.ne");
+		case F_FLOAT8LT:
+			/* a < b iff both ordered-less, or b is NaN and a is not */
+			ord = LLVMBuildFCmp(builder, LLVMRealOLT, lhs, rhs, "f8.olt");
+			return LLVMBuildOr(builder, ord,
+							   LLVMBuildAnd(builder, nb,
+											LLVMBuildNot(builder, na,
+														 "f8.lhs.notnan"),
+											"f8.rhsnan"),
+							   "f8.lt");
+		case F_FLOAT8LE:
+			/* a <= b iff ordered-le, or b is NaN (NaN is the maximum) */
+			ord = LLVMBuildFCmp(builder, LLVMRealOLE, lhs, rhs, "f8.ole");
+			return LLVMBuildOr(builder, ord, nb, "f8.le");
+		case F_FLOAT8GT:
+			/* a > b iff ordered-greater, or a is NaN and b is not */
+			ord = LLVMBuildFCmp(builder, LLVMRealOGT, lhs, rhs, "f8.ogt");
+			return LLVMBuildOr(builder, ord,
+							   LLVMBuildAnd(builder, na,
+											LLVMBuildNot(builder, nb,
+														 "f8.rhs.notnan"),
+											"f8.lhsnan"),
+							   "f8.gt");
+		case F_FLOAT8GE:
+			/* a >= b iff ordered-ge, or a is NaN (NaN is the maximum) */
+			ord = LLVMBuildFCmp(builder, LLVMRealOGE, lhs, rhs, "f8.oge");
+			return LLVMBuildOr(builder, ord, na, "f8.ge");
+		default:
+			elog(ERROR, "uplpgsql: unexpected float8 comparison function %u",
+				 fid);
+			return NULL;
+	}
+}
+
 
 /* ================================================================
  * Expression compilation — unified Expr tree → LLVM IR
@@ -1708,7 +1773,6 @@ uplpgsql_compile_expr_bool(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 				OpExpr	   *op = (OpExpr *) expr;
 				Oid			fid = op->opfuncid;
 				LLVMIntPredicate int_pred = 0;
-				LLVMRealPredicate real_pred = 0;
 				bool		is_float_cmp = false;
 				bool		is_cross_cmp = false;
 
@@ -1748,19 +1812,11 @@ uplpgsql_compile_expr_bool(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 					{ int_pred = LLVMIntSLE; is_cross_cmp = true; }
 				else if (fid == F_INT48GE)
 					{ int_pred = LLVMIntSGE; is_cross_cmp = true; }
-				/* float8 comparisons */
-				else if (fid == F_FLOAT8EQ)
-					{ real_pred = LLVMRealOEQ; is_float_cmp = true; }
-				else if (fid == F_FLOAT8NE)
-					{ real_pred = LLVMRealONE; is_float_cmp = true; }
-				else if (fid == F_FLOAT8LT)
-					{ real_pred = LLVMRealOLT; is_float_cmp = true; }
-				else if (fid == F_FLOAT8LE)
-					{ real_pred = LLVMRealOLE; is_float_cmp = true; }
-				else if (fid == F_FLOAT8GT)
-					{ real_pred = LLVMRealOGT; is_float_cmp = true; }
-				else if (fid == F_FLOAT8GE)
-					{ real_pred = LLVMRealOGE; is_float_cmp = true; }
+				/* float8 comparisons (NaN semantics handled in helper) */
+				else if (fid == F_FLOAT8EQ || fid == F_FLOAT8NE ||
+						 fid == F_FLOAT8LT || fid == F_FLOAT8LE ||
+						 fid == F_FLOAT8GT || fid == F_FLOAT8GE)
+					is_float_cmp = true;
 				/* bool comparisons */
 				else if (fid == F_BOOLEQ) int_pred = LLVMIntEQ;
 				else if (fid == F_BOOLNE) int_pred = LLVMIntNE;
@@ -1774,8 +1830,7 @@ uplpgsql_compile_expr_bool(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 						(Expr *) linitial(op->args), estate_ref, &lt);
 					rhs = uplpgsql_compile_expr_datum(ctx,
 						(Expr *) lsecond(op->args), estate_ref, &rt);
-					return LLVMBuildFCmp(builder, real_pred, lhs, rhs,
-										 "fcmp.result");
+					return emit_float8_cmp(ctx, fid, lhs, rhs);
 				}
 
 				if (int_pred != 0)
