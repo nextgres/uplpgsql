@@ -271,6 +271,31 @@ END; $$;
 SELECT cov_noshadow();
 RESET uplpgsql.extra_errors;
 
+-- extra_errors is a CREATE-time (validator) check, not an execution-time one.
+-- The call handler must pass forValidator = false: passing the trigger flag
+-- there compiled every trigger in validator mode on each fire, so a plain DML
+-- statement failed whenever this GUC happened to be set.
+CREATE TABLE cov_trg_t(i int);
+CREATE FUNCTION cov_trg_shadow() RETURNS trigger LANGUAGE uplpgsql AS $$
+DECLARE x int := 1;
+BEGIN
+  DECLARE x int := 2;
+  BEGIN
+    RETURN new;
+  END;
+END; $$;
+CREATE TRIGGER cov_trg BEFORE INSERT ON cov_trg_t
+  FOR EACH ROW EXECUTE FUNCTION cov_trg_shadow();
+
+-- firing the trigger with the check on must NOT error
+SET uplpgsql.extra_errors TO 'shadowed_variables';
+INSERT INTO cov_trg_t VALUES (1);
+RESET uplpgsql.extra_errors;
+SELECT count(*) AS trg_rows FROM cov_trg_t;
+
+DROP TABLE cov_trg_t CASCADE;
+DROP FUNCTION cov_trg_shadow();
+
 -- strict_multi_assignment: too many source columns
 SET uplpgsql.extra_errors TO 'strict_multi_assignment';
 CREATE FUNCTION cov_strict_multi() RETURNS int LANGUAGE uplpgsql AS $$

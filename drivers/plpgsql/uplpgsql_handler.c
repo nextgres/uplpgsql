@@ -346,7 +346,16 @@ uplpgsql_call_handler(PG_FUNCTION_ARGS)
 	/*
 	 * Compile the function (get AST via our forked parser).
 	 */
-	func = uplpgsql_compile(fcinfo, isTrigger || isEventTrigger);
+	/*
+	 * forValidator is false here: we are executing, not validating.  It must
+	 * not be confused with the trigger flags — those reach do_compile()
+	 * through fcinfo's context, which is already set up by the caller.
+	 * Passing the trigger flag compiled every trigger in validator mode on
+	 * every fire, which ran the extra syntax checks at execution time and,
+	 * worse, applied uplpgsql.extra_warnings/extra_errors to a running
+	 * trigger — so a DML statement could fail purely because a GUC was set.
+	 */
+	func = uplpgsql_compile(fcinfo, false);
 
 	/* Must save and restore prior value of cur_estate */
 	save_cur_estate = func->cur_estate;
