@@ -3,7 +3,7 @@
 A JIT-compiling PL/pgSQL for Postgres, derived from the NEXTGRES Universal Procedural Language (UPL) compiler and runtime.
 
 > [!WARNING]
-> This is a pre-alpha work-in-progress predicated on an AI-assisted analysis and JIT-oriented reconstruction of the UPL compiler and runtime. Do not use it in production. Interfaces and behaviour will change without notice. Crashes, correcteness issues, and data loss are very likely.
+> This is a pre-alpha work-in-progress predicated on an AI-assisted analysis and JIT-oriented reconstruction of the UPL compiler and runtime. Do not use it in production. Interfaces and behaviour will change without notice. Crashes, correctness issues, and data loss are very likely.
 
 ## What it is
 
