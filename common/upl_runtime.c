@@ -398,15 +398,15 @@ uplpgsql_rt_assign_null(UPLpgSQL_exec_state *estate, int dno)
 	UPLpgSQL_execstate *plstate = estate->uplpgsql_estate;
 	UPLpgSQL_var *var = (UPLpgSQL_var *) plstate->datums[dno];
 
-	if (var->freeval)
-	{
-		pfree(DatumGetPointer(var->value));
-		var->freeval = false;
-	}
-
-	var->value = (Datum) 0;
-	var->isnull = true;
-	var->freeval = false;
+	/*
+	 * Go through assign_simple_var so a read/write expanded object currently
+	 * held in var->value is released with DeleteExpandedObject rather than a
+	 * bare pfree of its header chunk (which would leak the object's context
+	 * and can corrupt the allocator).  Reachable from CASE, which clears its
+	 * temporary search variable this way, and that variable can hold an
+	 * expanded array/record value.
+	 */
+	assign_simple_var(plstate, var, (Datum) 0, true, false);
 }
 
 /*
