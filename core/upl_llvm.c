@@ -356,12 +356,23 @@ upl_jit_compile(LLVMModuleRef module, LLVMContextRef context,
 			elog(ERROR, "upl: failed to parse bitcode in OrcJIT context");
 		}
 
+		/* Parse does not take ownership of the buffer; free it now. */
+		LLVMDisposeMemoryBuffer(buf);
+
 		/*
 		 * Wrap the fresh context in a ThreadSafeContext (takes ownership of
 		 * new_ctx), then wrap the module (takes ownership of new_module).
 		 */
 		ts_ctx = LLVMOrcCreateNewThreadSafeContextFromLLVMContext(new_ctx);
 		ts_mod = LLVMOrcCreateNewThreadSafeModule(new_module, ts_ctx);
+
+		/*
+		 * The ThreadSafeModule holds its own reference to the context, so the
+		 * local ts_ctx handle is now redundant — dispose it here.  (ts_mod
+		 * ownership passes to LLJIT below, on both the success and error paths,
+		 * so it must not be disposed again.)
+		 */
+		LLVMOrcDisposeThreadSafeContext(ts_ctx);
 
 		/* Dispose original module (we have the copy now) */
 		LLVMDisposeModule(module);
@@ -376,7 +387,7 @@ upl_jit_compile(LLVMModuleRef module, LLVMContextRef context,
 		char *pstr = pstrdup(msg);
 
 		LLVMDisposeErrorMessage(msg);
-		LLVMOrcDisposeThreadSafeContext(ts_ctx);
+		/* ts_ctx already disposed; AddLLVMIRModule consumes ts_mod on error. */
 		elog(ERROR, "upl: failed to add module to OrcJIT: %s", pstr);
 	}
 
