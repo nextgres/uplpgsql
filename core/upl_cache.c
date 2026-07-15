@@ -158,6 +158,14 @@ upl_cache_lookup(Oid fn_oid, TransactionId fn_xmin, ItemPointerData fn_tid,
 	if (entry->jit_func == UPL_SKIP_JIT)
 		return UPL_CACHE_SKIP;
 
+	/*
+	 * Unreachable today — store always writes either a real pointer or the
+	 * SKIP sentinel — but a NULL here would otherwise be reported as a HIT and
+	 * the caller would jump through it.  Treat it as "not yet decided".
+	 */
+	if (entry->jit_func == NULL)
+		return UPL_CACHE_MISS;
+
 	*jitfunc_out = entry->jit_func;
 	return UPL_CACHE_HIT;
 }

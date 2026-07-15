@@ -59,23 +59,34 @@ emit_datum_ptr(UPL_compile_ctx *ctx, LLVMValueRef estate_ref, int dno,
 	LLVMTypeRef			i64 = ctx->types[UPL_INT64];
 	LLVMTypeRef			ptr = ctx->types[UPL_PTR];
 	LLVMValueRef		off, gep, lang_state, datums, datum;
+	char				nbuf[64];
+
+	/*
+	 * prefix ("ld"/"st"/"in") distinguishes the load, store and init chains in
+	 * the emitted IR, which matters once uplpgsql.dump_ir is on — otherwise
+	 * every chain produces identically-named values.
+	 */
+#define UPL_DNAME(suffix) \
+	(snprintf(nbuf, sizeof(nbuf), "%s." suffix, prefix), nbuf)
 
 	/* estate → lang_state (byte-offset GEP + pointer load) */
 	off = LLVMConstInt(i64, offsets->estate_to_lang_state, false);
 	gep = LLVMBuildGEP2(builder, i8, estate_ref, &off, 1,
-						 "lang_state.ptr");
-	lang_state = LLVMBuildLoad2(builder, ptr, gep, "lang_state");
+						 UPL_DNAME("lang_state.ptr"));
+	lang_state = LLVMBuildLoad2(builder, ptr, gep, UPL_DNAME("lang_state"));
 
 	/* lang_state → datums array pointer */
 	off = LLVMConstInt(i64, offsets->lang_state_to_datums, false);
 	gep = LLVMBuildGEP2(builder, i8, lang_state, &off, 1,
-						 "datums.ptr");
-	datums = LLVMBuildLoad2(builder, ptr, gep, "datums");
+						 UPL_DNAME("datums.ptr"));
+	datums = LLVMBuildLoad2(builder, ptr, gep, UPL_DNAME("datums"));
 
 	/* datums[dno] → individual datum pointer */
 	off = LLVMConstInt(i64, dno, false);
-	gep = LLVMBuildGEP2(builder, ptr, datums, &off, 1, "datum.slot");
-	datum = LLVMBuildLoad2(builder, ptr, gep, "datum");
+	gep = LLVMBuildGEP2(builder, ptr, datums, &off, 1, UPL_DNAME("datum.slot"));
+	datum = LLVMBuildLoad2(builder, ptr, gep, UPL_DNAME("datum"));
+
+#undef UPL_DNAME
 
 	return datum;
 }

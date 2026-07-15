@@ -296,6 +296,7 @@ typedef UPL_compile_ctx UPLpgSQL_compile_ctx;
 
 /* --- uplpgsql_handler.c GUCs --- */
 extern bool uplpgsql_enable_jit_heuristic;
+extern bool uplpgsql_dump_ir;
 
 /* --- uplpgsql_compile.c --- */
 extern bool uplpgsql_should_jit(UPLpgSQL_function *func);

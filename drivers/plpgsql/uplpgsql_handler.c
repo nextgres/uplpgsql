@@ -62,9 +62,12 @@
 #include "utils/syscache.h"
 #include "utils/varlena.h"
 
+/* Extension version, as reported by PG_MODULE_MAGIC_EXT and \dx */
+#define UPLPGSQL_VERSION	"1.0"
+
 PG_MODULE_MAGIC_EXT(
 					.name = "uplpgsql",
-					.version = PG_VERSION
+					.version = UPLPGSQL_VERSION
 );
 
 /*
@@ -103,7 +106,7 @@ UPLpgSQL_plugin **uplpgsql_plugin_ptr = NULL;
  * dump_ir:              Dump the generated LLVM IR to the server log (debugging)
  */
 static bool uplpgsql_log_compilation = false;
-static bool uplpgsql_dump_ir = false;
+bool		uplpgsql_dump_ir = false;
 bool		uplpgsql_enable_jit_heuristic = false;
 
 /* Forward declarations for GUC hooks */
@@ -194,8 +197,6 @@ _PG_init(void)
 							   uplpgsql_extra_errors_assign_hook,
 							   NULL);
 
-	MarkGUCPrefixReserved("uplpgsql");
-
 	/* uplpgsql-specific GUCs */
 	DefineCustomBoolVariable("uplpgsql.log_compilation",
 							 "Log when functions are JIT compiled.",
@@ -221,6 +222,14 @@ _PG_init(void)
 							 false,
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);
+
+	/*
+	 * Reserve the prefix only after every uplpgsql.* GUC is defined.  Doing it
+	 * earlier discards the placeholders for the ones defined below, so a value
+	 * SET before the module was first loaded in a session was thrown away with
+	 * "invalid configuration parameter name".
+	 */
+	MarkGUCPrefixReserved("uplpgsql");
 
 	/* Register transaction callbacks for cleanup */
 	RegisterXactCallback(uplpgsql_xact_cb, NULL);
@@ -435,8 +444,9 @@ uplpgsql_call_handler(PG_FUNCTION_ARGS)
 					MemoryContextSwitchTo(oldcontext);
 					CurrentResourceOwner = oldowner;
 
-					elog(LOG, "uplpgsql: JIT compiled function %s (oid %u)",
-						 func->fn_signature, func->fn_oid);
+					if (uplpgsql_log_compilation)
+						elog(LOG, "uplpgsql: JIT compiled function %s (oid %u)",
+							 func->fn_signature, func->fn_oid);
 				}
 				PG_CATCH();
 				{
@@ -449,9 +459,10 @@ uplpgsql_call_handler(PG_FUNCTION_ARGS)
 					CurrentResourceOwner = oldowner;
 
 					jitfunc = NULL;
-					elog(LOG, "uplpgsql: JIT compilation failed for %s, "
-						 "using interpreter",
-						 func->fn_signature);
+					if (uplpgsql_log_compilation)
+						elog(LOG, "uplpgsql: JIT compilation failed for %s, "
+							 "using interpreter",
+							 func->fn_signature);
 				}
 				PG_END_TRY();
 			}
@@ -463,8 +474,9 @@ uplpgsql_call_handler(PG_FUNCTION_ARGS)
 									 func->cfunc.fn_tid,
 									 func);
 				jitfunc = NULL;
-				elog(LOG, "uplpgsql: skipping JIT for %s (heuristic)",
-					 func->fn_signature);
+				if (uplpgsql_log_compilation)
+					elog(LOG, "uplpgsql: skipping JIT for %s (heuristic)",
+						 func->fn_signature);
 			}
 		}
 		else if (cache_status == UPL_CACHE_SKIP)

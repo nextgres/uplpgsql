@@ -1081,6 +1081,13 @@ uplpgsql_rt_exception_try_exit(UPLpgSQL_exec_state *estate, void *frame_ptr)
 	/*
 	 * If there's a return value, transfer it out of the subtransaction's
 	 * memory before we commit (which destroys the subtransaction's context).
+	 *
+	 * exec_stmt_block guards this with "rc == PLPGSQL_RC_RETURN &&" as well.
+	 * We do not have rc here, but the test is equivalent: retisnull is only
+	 * cleared by a RETURN that produced a value, so a non-RETURN exit always
+	 * has retisnull set and skips the transfer.  Kept deliberately, not by
+	 * oversight — threading rc in for a check that cannot change the outcome
+	 * would cost a load and an argument on every block exit.
 	 */
 	if (!plstate->retisset && !plstate->retisnull)
 	{
@@ -1217,6 +1224,22 @@ uplpgsql_rt_exception_set_handler_vars(UPLpgSQL_exec_state *estate,
 					unpack_sql_state(edata->sqlerrcode));
 	assign_text_var(plstate, errm_var, edata->message);
 
+	/*
+	 * Also record the code in the execstate and refresh the user-declared
+	 * SQLSTATE variable, as exec_stmt_block's handler setup does.
+	 *
+	 * This is distinct from the block's own SQLSTATE above: that one is the
+	 * variable the grammar creates for every EXCEPTION block, while
+	 * estate->sqlstate_varno tracks a SQL/PSM-style declared SQLSTATE char(5)
+	 * that the runtime keeps current (block entry, after FETCH, and here).
+	 * The PL/pgSQL grammar never sets stmt_block->sqlstate_varno, so
+	 * uplpgsql_set_sqlstate() is a no-op for this driver today and the
+	 * omission was invisible — but the plumbing is shared with the SQL/PSM
+	 * driver, where it is not.
+	 */
+	plstate->sqlerrcode = edata->sqlerrcode;
+	uplpgsql_set_sqlstate(plstate);
+
 	/* Set cur_error so GET STACKED DIAGNOSTICS works inside the handler */
 	plstate->cur_error = edata;
 }
@@ -1269,7 +1292,15 @@ uplpgsql_rt_exception_rethrow(UPLpgSQL_exec_state *estate, void *frame_ptr)
 	plstate->cur_error = frame->saved_cur_error;
 	estate->cur_error = frame->saved_cur_error;
 
-	/* Restore stmt_mcontext and rethrow */
+	/*
+	 * Restore stmt_mcontext and rethrow.
+	 *
+	 * The interpreter does not pop here — it lets the outer PG_CATCH unwind do
+	 * it.  Popping first is safe: pop_stmt_mcontext only restores the stack
+	 * pointer, it does not reset the context, so edata (which lives there)
+	 * stays valid across ReThrowError.  Done explicitly because the JIT has no
+	 * enclosing PG_CATCH of its own to unwind for it.
+	 */
 	pop_stmt_mcontext(plstate);
 
 	/*

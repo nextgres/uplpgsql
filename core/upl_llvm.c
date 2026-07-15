@@ -237,6 +237,15 @@ upl_get_jit(void)
 void
 upl_register_types(UPL_compile_ctx *ctx)
 {
+	/*
+	 * UPL_INTPTR is Int64 and upl_const_ptr() builds pointers out of UPL_INT64,
+	 * so a 32-bit host would silently truncate every embedded pointer.  All
+	 * supported builds are 64-bit; fail at compile time rather than at run
+	 * time if that ever changes.
+	 */
+	StaticAssertStmt(sizeof(void *) == 8,
+					 "UPL assumes 64-bit pointers");
+
 	ctx->types[UPL_VOID]   = LLVMVoidTypeInContext(ctx->context);
 	ctx->types[UPL_INT1]   = LLVMInt1TypeInContext(ctx->context);
 	ctx->types[UPL_INT8]   = LLVMInt8TypeInContext(ctx->context);

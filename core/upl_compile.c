@@ -451,12 +451,36 @@ upl_emit_fori(UPL_compile_ctx *ctx, const char *label,
 	else
 		step = upl_const_int32(ctx, 1);
 
-	/* Allocate loop value and found flag */
-	loop_val_ptr = LLVMBuildAlloca(ctx->builder, ctx->types[UPL_INT32],
-								   "loop_val");
-	LLVMBuildStore(ctx->builder, lower, loop_val_ptr);
+	/*
+	 * Allocate loop value and found flag in the entry block.
+	 *
+	 * An alloca emitted at the current position lands inside whatever block we
+	 * happen to be in — for a FOR nested in a high-iteration loop that is a
+	 * per-iteration block, and the stack is not reclaimed until the function
+	 * returns.  mem2reg promotes these scalars away at the -O3 we run, so it
+	 * is latent today, but the entry block is where they belong (PG's own
+	 * llvmjit does the same).
+	 */
+	{
+		LLVMBasicBlockRef	saved_bb = LLVMGetInsertBlock(ctx->builder);
+		LLVMValueRef		first_instr;
 
-	found_ptr = LLVMBuildAlloca(ctx->builder, ctx->types[UPL_INT1], "found");
+		first_instr = LLVMGetFirstInstruction(ctx->entry_bb);
+		if (first_instr)
+			LLVMPositionBuilderBefore(ctx->builder, first_instr);
+		else
+			LLVMPositionBuilderAtEnd(ctx->builder, ctx->entry_bb);
+
+		loop_val_ptr = LLVMBuildAlloca(ctx->builder, ctx->types[UPL_INT32],
+									   "loop_val");
+		found_ptr = LLVMBuildAlloca(ctx->builder, ctx->types[UPL_INT1],
+									"found");
+
+		LLVMPositionBuilderAtEnd(ctx->builder, saved_bb);
+	}
+
+	/* Initialise them where the loop actually starts */
+	LLVMBuildStore(ctx->builder, lower, loop_val_ptr);
 	LLVMBuildStore(ctx->builder,
 				   LLVMConstInt(ctx->types[UPL_INT1], 0, false), found_ptr);
 
@@ -943,6 +967,15 @@ upl_compile_function(UPL_compile_ctx *ctx, UPL_compile_hooks *hooks)
 
 		/* 14. Verify the module */
 		upl_verify_module(ctx->module);
+
+		/* 14a. Optionally dump the IR (uplpgsql.dump_ir). */
+		if (hooks->dump_ir)
+		{
+			char *ir = LLVMPrintModuleToString(ctx->module);
+
+			elog(LOG, "upl: IR for %s:\n%s", func_name, ir);
+			LLVMDisposeMessage(ir);
+		}
 
 		/* 15. Optimize */
 		upl_optimize_module(ctx->module, 3);

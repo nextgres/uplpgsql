@@ -1418,6 +1418,7 @@ uplpgsql_compile_function(UPLpgSQL_function *func)
 	hooks.fn_xmin = func->cfunc.fn_xmin;
 	hooks.fn_tid = func->cfunc.fn_tid;
 	hooks.default_rc = UPLPGSQL_RC_OK;
+	hooks.dump_ir = uplpgsql_dump_ir;
 
 	/* Run the core compilation pipeline */
 	fn_ptr = upl_compile_function(&ctx, &hooks);
