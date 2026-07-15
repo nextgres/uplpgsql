@@ -516,3 +516,141 @@ drop function flt_div_zero(); drop function flt_overflow(); drop function flt_un
 drop function flt_nan_gt(); drop function flt_gt_nan(); drop function flt_nan_eq();
 drop function flt_nan_ne(); drop function flt_inf(); drop function flt_normal();
 drop function flt_neg_zero();
+
+--
+-- float8 with PostgreSQL semantics, compiled natively.
+--
+-- These are the cases a raw IEEE lowering gets wrong: the guards in
+-- float8_pl/_mul/_div mean Infinity and zero operands must NOT raise, while
+-- a finite computation that becomes Infinity or zero must.  NaN sorts above
+-- everything, and NaN = NaN is true.
+--
+
+-- division by zero raises; but NaN/0 does not (the check is
+-- "val2 == 0 && !isnan(val1)")
+create function fn_div0() returns text language uplpgsql as $$
+declare a float8 := 1; b float8 := 0; r float8;
+begin r := a / b; return r::text;
+exception when division_by_zero then return 'div0'; end; $$;
+select fn_div0();
+create function fn_zero_div0() returns text language uplpgsql as $$
+declare a float8 := 0; b float8 := 0; r float8;
+begin r := a / b; return r::text;
+exception when division_by_zero then return 'div0'; end; $$;
+select fn_zero_div0();
+create function fn_nan_div0() returns text language uplpgsql as $$
+declare a float8 := 'NaN'; b float8 := 0; r float8;
+begin r := a / b; return r::text;
+exception when division_by_zero then return 'div0'; end; $$;
+select fn_nan_div0();
+
+-- a finite computation reaching Infinity overflows
+create function fn_ovf_mul() returns text language uplpgsql as $$
+declare a float8 := 1e308; b float8 := 10; r float8;
+begin r := a * b; return r::text; exception when others then return sqlstate; end; $$;
+select fn_ovf_mul();
+create function fn_ovf_add() returns text language uplpgsql as $$
+declare a float8 := 1.7e308; b float8 := 1.7e308; r float8;
+begin r := a + b; return r::text; exception when others then return sqlstate; end; $$;
+select fn_ovf_add();
+
+-- but an Infinity operand does not: the result was already infinite
+create function fn_inf_add() returns text language uplpgsql as $$
+declare a float8 := 'Infinity'; b float8 := 1; r float8; begin r := a + b; return r::text; end; $$;
+select fn_inf_add();
+create function fn_inf_mul() returns text language uplpgsql as $$
+declare a float8 := 'Infinity'; b float8 := 2; r float8; begin r := a * b; return r::text; end; $$;
+select fn_inf_mul();
+create function fn_inf_div() returns text language uplpgsql as $$
+declare a float8 := 'Infinity'; b float8 := 2; r float8; begin r := a / b; return r::text; end; $$;
+select fn_inf_div();
+
+-- a finite computation collapsing to zero underflows
+create function fn_unf_div() returns text language uplpgsql as $$
+declare a float8 := 1e-320; b float8 := 1e10; r float8;
+begin r := a / b; return r::text; exception when others then return sqlstate; end; $$;
+select fn_unf_div();
+create function fn_unf_mul() returns text language uplpgsql as $$
+declare a float8 := 1e-320; b float8 := 1e-10; r float8;
+begin r := a * b; return r::text; exception when others then return sqlstate; end; $$;
+select fn_unf_mul();
+
+-- but a zero operand does not, nor does dividing by Infinity
+create function fn_zero_mul() returns text language uplpgsql as $$
+declare a float8 := 0; b float8 := 5; r float8; begin r := a * b; return r::text; end; $$;
+select fn_zero_mul();
+create function fn_div_inf() returns text language uplpgsql as $$
+declare a float8 := 1; b float8 := 'Infinity'; r float8; begin r := a / b; return r::text; end; $$;
+select fn_div_inf();
+
+-- NaN propagates without raising
+create function fn_nan_add() returns text language uplpgsql as $$
+declare a float8 := 'NaN'; b float8 := 1; r float8; begin r := a + b; return r::text; end; $$;
+select fn_nan_add();
+
+-- ordinary arithmetic and unary minus
+create function fn_normal() returns text language uplpgsql as $$
+declare a float8 := 1.5; b float8 := 2; r float8; begin r := a * b + 1; return r::text; end; $$;
+select fn_normal();
+create function fn_neg() returns text language uplpgsql as $$
+declare a float8 := 2.5; r float8; begin r := -a; return r::text; end; $$;
+select fn_neg();
+
+-- the full NaN comparison matrix: NaN is greater than everything, equal to
+-- itself.  LLVM's ordered predicates alone answer false to all of these.
+create function fn_cmp() returns text language uplpgsql as $$
+declare n float8 := 'NaN'; o float8 := 1; s text := '';
+begin
+  s := s || (n =  o)::text || ',' || (o =  n)::text || ',' || (n =  n)::text || '/';
+  s := s || (n <> o)::text || ',' || (o <> n)::text || ',' || (n <> n)::text || '/';
+  s := s || (n <  o)::text || ',' || (o <  n)::text || ',' || (n <  n)::text || '/';
+  s := s || (n <= o)::text || ',' || (o <= n)::text || ',' || (n <= n)::text || '/';
+  s := s || (n >  o)::text || ',' || (o >  n)::text || ',' || (n >  n)::text || '/';
+  s := s || (n >= o)::text || ',' || (o >= n)::text || ',' || (n >= n)::text;
+  return s;
+end; $$;
+select fn_cmp();
+
+-- NaN comparison driving control flow (the Tier 1 bool path)
+create function fn_cmp_if() returns text language uplpgsql as $$
+declare n float8 := 'NaN'; o float8 := 1;
+begin if n > o then return 'nan-is-greater'; else return 'no'; end if; end; $$;
+select fn_cmp_if();
+
+-- NULL still propagates through the native float path: the strict guard must
+-- skip the computation, so neither the zero divide nor the overflow fires
+create function fn_null_add() returns text language uplpgsql as $$
+declare a float8; b float8 := 1; r float8; begin r := a + b; return coalesce(r::text,'NULL'); end; $$;
+select fn_null_add();
+create function fn_null_div0() returns text language uplpgsql as $$
+declare a float8; b float8 := 0; r float8;
+begin r := a / b; return coalesce(r::text,'NULL');
+exception when division_by_zero then return 'div0'; end; $$;
+select fn_null_div0();
+create function fn_null_ovf() returns text language uplpgsql as $$
+declare a float8; b float8 := 1e308; r float8;
+begin r := a * b; return coalesce(r::text,'NULL');
+exception when others then return sqlstate; end; $$;
+select fn_null_ovf();
+create function fn_null_cmp() returns text language uplpgsql as $$
+declare a float8; b float8 := 1; begin if a < b then return 'T'; else return 'F-or-N'; end if; end; $$;
+select fn_null_cmp();
+
+-- float8 arrays exercise the native subscript read feeding native arithmetic
+create function fn_array_sum() returns text language uplpgsql as $$
+declare x float8[]; t float8 := 0; i int;
+begin
+  x := array_fill(1.5::float8, array[4]);
+  for i in 1..4 loop t := t + x[i] * 2.0; end loop;
+  return t::text;
+end; $$;
+select fn_array_sum();
+
+drop function fn_div0(); drop function fn_zero_div0(); drop function fn_nan_div0();
+drop function fn_ovf_mul(); drop function fn_ovf_add();
+drop function fn_inf_add(); drop function fn_inf_mul(); drop function fn_inf_div();
+drop function fn_unf_div(); drop function fn_unf_mul();
+drop function fn_zero_mul(); drop function fn_div_inf(); drop function fn_nan_add();
+drop function fn_normal(); drop function fn_neg(); drop function fn_cmp();
+drop function fn_cmp_if(); drop function fn_null_add(); drop function fn_null_div0();
+drop function fn_null_ovf(); drop function fn_null_cmp(); drop function fn_array_sum();

@@ -931,21 +931,26 @@ uplpgsql_classify_expr(Expr *expr)
 				}
 
 				/*
-				 * float8 arithmetic is deliberately NOT Tier 1.
+				 * float8 arithmetic.
 				 *
-				 * PostgreSQL's float8 operators are not the raw IEEE
-				 * instructions: float8_div() raises division_by_zero rather
-				 * than returning Infinity, and every operator raises
-				 * numeric_value_out_of_range on overflow/underflow instead of
-				 * saturating (see float8_pl/_mi/_mul/_div in utils/float.h).
-				 * Emitting fadd/fdiv inline silently drops all of that.
-				 *
-				 * Leaving these unclassified sends them to Tier 2, which
-				 * calls the real float8_* functions and so inherits their
-				 * semantics exactly.  float8 Consts, Params and array
-				 * subscripts stay classified below, so native array reads
-				 * are unaffected.
+				 * Compiled natively, but with PostgreSQL's semantics rather
+				 * than the raw IEEE ones — overflow/underflow and division by
+				 * zero raise instead of saturating.  See emit_float_addsub/
+				 * _mul/_div, which mirror float8_pl/_mi/_mul/_div from
+				 * utils/float.h.
 				 */
+				if (fid == F_FLOAT8PL || fid == F_FLOAT8MI ||
+					fid == F_FLOAT8MUL || fid == F_FLOAT8DIV ||
+					fid == F_FLOAT8UM)
+				{
+					ListCell *lc;
+					foreach(lc, op->args)
+					{
+						if (uplpgsql_classify_expr((Expr *) lfirst(lc)) != EXPR_TYPE_FLOAT8)
+							return EXPR_TYPE_UNKNOWN;
+					}
+					return EXPR_TYPE_FLOAT8;
+				}
 
 				/* int4 comparisons → bool */
 				if (fid == F_INT4EQ || fid == F_INT4NE ||
@@ -974,13 +979,24 @@ uplpgsql_classify_expr(Expr *expr)
 				}
 
 				/*
-				 * float8 comparisons are deliberately NOT Tier 1 either.
+				 * float8 comparisons → bool.
 				 *
-				 * LLVM's ordered predicates are false whenever an operand is
-				 * NaN, but PostgreSQL sorts NaN above every other value and
-				 * treats NaN = NaN as true (float8_eq/_gt in utils/float.h).
-				 * Tier 2 calls those functions and gets it right.
+				 * Compiled natively via emit_float_cmp(), which reproduces
+				 * float8_eq/_ne/_lt/_le/_gt/_ge from utils/float.h: NaN sorts
+				 * above every other value and NaN = NaN is true, neither of
+				 * which LLVM's ordered predicates give on their own.
 				 */
+				if (fid == F_FLOAT8EQ || fid == F_FLOAT8NE ||
+					fid == F_FLOAT8LT || fid == F_FLOAT8LE ||
+					fid == F_FLOAT8GT || fid == F_FLOAT8GE)
+				{
+					if (list_length(op->args) != 2)
+						return EXPR_TYPE_UNKNOWN;
+					if (uplpgsql_classify_expr(linitial(op->args)) != EXPR_TYPE_FLOAT8 ||
+						uplpgsql_classify_expr(lsecond(op->args)) != EXPR_TYPE_FLOAT8)
+						return EXPR_TYPE_UNKNOWN;
+					return EXPR_TYPE_BOOL;
+				}
 
 				/* bool equality/inequality → bool */
 				if (fid == F_BOOLEQ || fid == F_BOOLNE)
@@ -1214,6 +1230,254 @@ emit_error_call(UPLpgSQL_compile_ctx *ctx, const char *fn_name)
 
 	LLVMBuildCall2(ctx->builder, err_ft, err_fn, NULL, 0, "");
 	LLVMBuildUnreachable(ctx->builder);
+}
+
+
+/* ================================================================
+ * float8 arithmetic and comparison with PostgreSQL semantics
+ *
+ * PostgreSQL's float8 operators are not the raw IEEE instructions.  They
+ * raise on overflow and underflow rather than saturating to Infinity or 0,
+ * they raise division_by_zero rather than returning Infinity, and they order
+ * NaN above every other value with NaN = NaN true.  See float8_pl/_mi/_mul/
+ * _div and float8_eq/_ne/_lt/_le/_gt/_ge in utils/float.h — the code below
+ * mirrors those definitions exactly.
+ *
+ * The error paths call PostgreSQL's own float_overflow_error(),
+ * float_underflow_error() and float_zero_divide_error(), which the JIT
+ * resolves as process symbols, so the errors raised are identical to the
+ * interpreter's rather than merely similar.
+ * ================================================================
+ */
+
+/* isnan(v): true when v is unordered with itself */
+static LLVMValueRef
+emit_float_isnan(UPLpgSQL_compile_ctx *ctx, LLVMValueRef v, const char *name)
+{
+	return LLVMBuildFCmp(ctx->builder, LLVMRealUNO, v, v, name);
+}
+
+/* isinf(v): v == +Inf || v == -Inf */
+static LLVMValueRef
+emit_float_isinf(UPLpgSQL_compile_ctx *ctx, LLVMValueRef v, const char *name)
+{
+	LLVMBuilderRef	builder = ctx->builder;
+	LLVMTypeRef		dbl = ctx->types[UPLPGSQL_DOUBLE];
+	LLVMValueRef	pos, neg;
+
+	pos = LLVMBuildFCmp(builder, LLVMRealOEQ, v,
+						LLVMConstReal(dbl, INFINITY), "isinf.p");
+	neg = LLVMBuildFCmp(builder, LLVMRealOEQ, v,
+						LLVMConstReal(dbl, -INFINITY), "isinf.n");
+	return LLVMBuildOr(builder, pos, neg, name);
+}
+
+/* v == 0.0 */
+static LLVMValueRef
+emit_float_iszero(UPLpgSQL_compile_ctx *ctx, LLVMValueRef v, const char *name)
+{
+	return LLVMBuildFCmp(ctx->builder, LLVMRealOEQ, v,
+						 LLVMConstReal(ctx->types[UPLPGSQL_DOUBLE], 0.0),
+						 name);
+}
+
+/*
+ * Branch to a float error function when cond holds, else continue.
+ */
+static void
+emit_float_error_if(UPLpgSQL_compile_ctx *ctx, LLVMValueRef cond,
+					const char *fn_name, const char *tag)
+{
+	LLVMBasicBlockRef	err_bb, ok_bb;
+
+	err_bb = expr_append_block(ctx, tag);
+	ok_bb = expr_append_block(ctx, "f8.ok");
+
+	LLVMBuildCondBr(ctx->builder, cond, err_bb, ok_bb);
+
+	LLVMPositionBuilderAtEnd(ctx->builder, err_bb);
+	emit_error_call(ctx, fn_name);
+
+	LLVMPositionBuilderAtEnd(ctx->builder, ok_bb);
+}
+
+/*
+ * float8_pl / float8_mi:
+ *   result = val1 +/- val2;
+ *   if (isinf(result) && !isinf(val1) && !isinf(val2)) overflow;
+ */
+static LLVMValueRef
+emit_float_addsub(UPLpgSQL_compile_ctx *ctx, LLVMValueRef lhs,
+				  LLVMValueRef rhs, bool is_add)
+{
+	LLVMBuilderRef	builder = ctx->builder;
+	LLVMValueRef	result, cond;
+
+	result = is_add ? LLVMBuildFAdd(builder, lhs, rhs, "f8.add")
+					: LLVMBuildFSub(builder, lhs, rhs, "f8.sub");
+
+	cond = LLVMBuildAnd(builder,
+		emit_float_isinf(ctx, result, "f8.r.inf"),
+		LLVMBuildAnd(builder,
+			LLVMBuildNot(builder, emit_float_isinf(ctx, lhs, "f8.l.inf"),
+						 "f8.l.fin"),
+			LLVMBuildNot(builder, emit_float_isinf(ctx, rhs, "f8.r2.inf"),
+						 "f8.r.fin"),
+			"f8.both.fin"),
+		"f8.ovf");
+
+	emit_float_error_if(ctx, cond, "float_overflow_error", "f8.ovf.err");
+	return result;
+}
+
+/*
+ * float8_mul:
+ *   result = val1 * val2;
+ *   if (isinf(result) && !isinf(val1) && !isinf(val2)) overflow;
+ *   if (result == 0.0 && val1 != 0.0 && val2 != 0.0) underflow;
+ */
+static LLVMValueRef
+emit_float_mul(UPLpgSQL_compile_ctx *ctx, LLVMValueRef lhs, LLVMValueRef rhs)
+{
+	LLVMBuilderRef	builder = ctx->builder;
+	LLVMValueRef	result, cond;
+
+	result = LLVMBuildFMul(builder, lhs, rhs, "f8.mul");
+
+	cond = LLVMBuildAnd(builder,
+		emit_float_isinf(ctx, result, "f8.r.inf"),
+		LLVMBuildAnd(builder,
+			LLVMBuildNot(builder, emit_float_isinf(ctx, lhs, "f8.l.inf"),
+						 "f8.l.fin"),
+			LLVMBuildNot(builder, emit_float_isinf(ctx, rhs, "f8.r2.inf"),
+						 "f8.r.fin"),
+			"f8.both.fin"),
+		"f8.ovf");
+	emit_float_error_if(ctx, cond, "float_overflow_error", "f8.ovf.err");
+
+	cond = LLVMBuildAnd(builder,
+		emit_float_iszero(ctx, result, "f8.r.zero"),
+		LLVMBuildAnd(builder,
+			LLVMBuildNot(builder, emit_float_iszero(ctx, lhs, "f8.l.zero"),
+						 "f8.l.nz"),
+			LLVMBuildNot(builder, emit_float_iszero(ctx, rhs, "f8.r2.zero"),
+						 "f8.r.nz"),
+			"f8.both.nz"),
+		"f8.unf");
+	emit_float_error_if(ctx, cond, "float_underflow_error", "f8.unf.err");
+
+	return result;
+}
+
+/*
+ * float8_div:
+ *   if (val2 == 0.0 && !isnan(val1)) division_by_zero;
+ *   result = val1 / val2;
+ *   if (isinf(result) && !isinf(val1)) overflow;
+ *   if (result == 0.0 && val1 != 0.0 && !isinf(val2)) underflow;
+ */
+static LLVMValueRef
+emit_float_div(UPLpgSQL_compile_ctx *ctx, LLVMValueRef lhs, LLVMValueRef rhs)
+{
+	LLVMBuilderRef	builder = ctx->builder;
+	LLVMValueRef	result, cond;
+
+	cond = LLVMBuildAnd(builder,
+		emit_float_iszero(ctx, rhs, "f8.d.zero"),
+		LLVMBuildNot(builder, emit_float_isnan(ctx, lhs, "f8.l.nan"),
+					 "f8.l.notnan"),
+		"f8.divzero");
+	emit_float_error_if(ctx, cond, "float_zero_divide_error", "f8.div0.err");
+
+	result = LLVMBuildFDiv(builder, lhs, rhs, "f8.div");
+
+	cond = LLVMBuildAnd(builder,
+		emit_float_isinf(ctx, result, "f8.r.inf"),
+		LLVMBuildNot(builder, emit_float_isinf(ctx, lhs, "f8.l.inf"),
+					 "f8.l.fin"),
+		"f8.ovf");
+	emit_float_error_if(ctx, cond, "float_overflow_error", "f8.ovf.err");
+
+	cond = LLVMBuildAnd(builder,
+		emit_float_iszero(ctx, result, "f8.r.zero"),
+		LLVMBuildAnd(builder,
+			LLVMBuildNot(builder, emit_float_iszero(ctx, lhs, "f8.l.zero"),
+						 "f8.l.nz"),
+			LLVMBuildNot(builder, emit_float_isinf(ctx, rhs, "f8.r2.inf"),
+						 "f8.r.fin"),
+			"f8.unf.rest"),
+		"f8.unf");
+	emit_float_error_if(ctx, cond, "float_underflow_error", "f8.unf.err");
+
+	return result;
+}
+
+/*
+ * float8_eq/_ne/_lt/_le/_gt/_ge — NaN sorts above every other value, and
+ * NaN = NaN is true, so the ordered LLVM predicates alone are wrong.  Each
+ * formula below is the literal transcription of the corresponding inline
+ * function in utils/float.h.  All are branch-free.
+ */
+static LLVMValueRef
+emit_float_cmp(UPLpgSQL_compile_ctx *ctx, Oid fid, LLVMValueRef lhs,
+			   LLVMValueRef rhs)
+{
+	LLVMBuilderRef	builder = ctx->builder;
+	LLVMValueRef	l_nan = emit_float_isnan(ctx, lhs, "f8.cmp.l.nan");
+	LLVMValueRef	r_nan = emit_float_isnan(ctx, rhs, "f8.cmp.r.nan");
+	LLVMValueRef	l_ok = LLVMBuildNot(builder, l_nan, "f8.cmp.l.ok");
+	LLVMValueRef	r_ok = LLVMBuildNot(builder, r_nan, "f8.cmp.r.ok");
+
+	if (fid == F_FLOAT8EQ)
+		/* isnan(l) ? isnan(r) : !isnan(r) && l == r */
+		return LLVMBuildSelect(builder, l_nan, r_nan,
+			LLVMBuildAnd(builder, r_ok,
+				LLVMBuildFCmp(builder, LLVMRealOEQ, lhs, rhs, "f8.oeq"),
+				"f8.eq.rhs"),
+			"f8.eq");
+
+	if (fid == F_FLOAT8NE)
+		/* isnan(l) ? !isnan(r) : isnan(r) || l != r */
+		return LLVMBuildSelect(builder, l_nan, r_ok,
+			LLVMBuildOr(builder, r_nan,
+				LLVMBuildFCmp(builder, LLVMRealONE, lhs, rhs, "f8.one"),
+				"f8.ne.rhs"),
+			"f8.ne");
+
+	if (fid == F_FLOAT8LT)
+		/* !isnan(l) && (isnan(r) || l < r) */
+		return LLVMBuildAnd(builder, l_ok,
+			LLVMBuildOr(builder, r_nan,
+				LLVMBuildFCmp(builder, LLVMRealOLT, lhs, rhs, "f8.olt"),
+				"f8.lt.rhs"),
+			"f8.lt");
+
+	if (fid == F_FLOAT8LE)
+		/* isnan(r) || (!isnan(l) && l <= r) */
+		return LLVMBuildOr(builder, r_nan,
+			LLVMBuildAnd(builder, l_ok,
+				LLVMBuildFCmp(builder, LLVMRealOLE, lhs, rhs, "f8.ole"),
+				"f8.le.rhs"),
+			"f8.le");
+
+	if (fid == F_FLOAT8GT)
+		/* !isnan(r) && (isnan(l) || l > r) */
+		return LLVMBuildAnd(builder, r_ok,
+			LLVMBuildOr(builder, l_nan,
+				LLVMBuildFCmp(builder, LLVMRealOGT, lhs, rhs, "f8.ogt"),
+				"f8.gt.rhs"),
+			"f8.gt");
+
+	if (fid == F_FLOAT8GE)
+		/* isnan(l) || (!isnan(r) && l >= r) */
+		return LLVMBuildOr(builder, l_nan,
+			LLVMBuildAnd(builder, r_ok,
+				LLVMBuildFCmp(builder, LLVMRealOGE, lhs, rhs, "f8.oge"),
+				"f8.ge.rhs"),
+			"f8.ge");
+
+	elog(ERROR, "uplpgsql: unhandled float8 comparison funcid %u", fid);
+	return NULL;
 }
 
 
@@ -1550,19 +1814,15 @@ uplpgsql_compile_expr_datum(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 							(uint64) PG_INT64_MIN);
 					}
 
-					/* --- float8 arithmetic --- */
+					/* --- float8 arithmetic (PG semantics, see above) --- */
 					if (fid == F_FLOAT8PL)
-						return LLVMBuildFAdd(builder, lhs, rhs, "f8.add");
+						return emit_float_addsub(ctx, lhs, rhs, true);
 					if (fid == F_FLOAT8MI)
-						return LLVMBuildFSub(builder, lhs, rhs, "f8.sub");
+						return emit_float_addsub(ctx, lhs, rhs, false);
 					if (fid == F_FLOAT8MUL)
-						return LLVMBuildFMul(builder, lhs, rhs, "f8.mul");
+						return emit_float_mul(ctx, lhs, rhs);
 					if (fid == F_FLOAT8DIV)
-					{
-						/* float8 division: PG checks for zero and infinity */
-						/* For now, just emit fdiv — matches IEEE 754 semantics */
-						return LLVMBuildFDiv(builder, lhs, rhs, "f8.div");
-					}
+						return emit_float_div(ctx, lhs, rhs);
 				}
 
 				/*
@@ -1895,7 +2155,7 @@ uplpgsql_compile_expr_bool(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 				OpExpr	   *op = (OpExpr *) expr;
 				Oid			fid = op->opfuncid;
 				LLVMIntPredicate int_pred = 0;
-				LLVMRealPredicate real_pred = 0;
+
 				bool		is_float_cmp = false;
 				bool		is_cross_cmp = false;
 
@@ -1935,19 +2195,15 @@ uplpgsql_compile_expr_bool(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 					{ int_pred = LLVMIntSLE; is_cross_cmp = true; }
 				else if (fid == F_INT48GE)
 					{ int_pred = LLVMIntSGE; is_cross_cmp = true; }
-				/* float8 comparisons */
-				else if (fid == F_FLOAT8EQ)
-					{ real_pred = LLVMRealOEQ; is_float_cmp = true; }
-				else if (fid == F_FLOAT8NE)
-					{ real_pred = LLVMRealONE; is_float_cmp = true; }
-				else if (fid == F_FLOAT8LT)
-					{ real_pred = LLVMRealOLT; is_float_cmp = true; }
-				else if (fid == F_FLOAT8LE)
-					{ real_pred = LLVMRealOLE; is_float_cmp = true; }
-				else if (fid == F_FLOAT8GT)
-					{ real_pred = LLVMRealOGT; is_float_cmp = true; }
-				else if (fid == F_FLOAT8GE)
-					{ real_pred = LLVMRealOGE; is_float_cmp = true; }
+				/*
+				 * float8 comparisons: emit_float_cmp() picks the form from
+				 * the funcid, since none of them is a plain LLVM predicate —
+				 * each needs NaN handling around it.
+				 */
+				else if (fid == F_FLOAT8EQ || fid == F_FLOAT8NE ||
+						 fid == F_FLOAT8LT || fid == F_FLOAT8LE ||
+						 fid == F_FLOAT8GT || fid == F_FLOAT8GE)
+					is_float_cmp = true;
 				/* bool comparisons */
 				else if (fid == F_BOOLEQ) int_pred = LLVMIntEQ;
 				else if (fid == F_BOOLNE) int_pred = LLVMIntNE;
@@ -1961,8 +2217,7 @@ uplpgsql_compile_expr_bool(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 						(Expr *) linitial(op->args), estate_ref, &lt);
 					rhs = uplpgsql_compile_expr_datum(ctx,
 						(Expr *) lsecond(op->args), estate_ref, &rt);
-					return LLVMBuildFCmp(builder, real_pred, lhs, rhs,
-										 "fcmp.result");
+					return emit_float_cmp(ctx, fid, lhs, rhs);
 				}
 
 				if (int_pred != 0)
