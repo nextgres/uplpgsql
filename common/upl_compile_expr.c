@@ -1584,7 +1584,32 @@ emit_int_divmod(UPLpgSQL_compile_ctx *ctx,
 	}
 	else
 	{
-		result = LLVMBuildSRem(builder, lhs, rhs, "mod.result");
+		/*
+		 * SREM traps on INT_MIN % -1: the implied quotient overflows, so the
+		 * x86 idiv raises #DE (SIGFPE) and takes the backend down, even though
+		 * the mathematical remainder is 0.  It is undefined behaviour in LLVM
+		 * either way — arm64 happens to return 0, which is why this is easy to
+		 * miss on Apple Silicon.  int4mod/int8mod special-case a divisor of -1
+		 * and return 0.
+		 *
+		 * Do the same without a branch: take the remainder against a divisor
+		 * that is never -1 (SREM by 1 is always 0 and cannot trap), then
+		 * select 0 when the real divisor was -1.
+		 */
+		LLVMValueRef	is_neg1,
+						safe_rhs,
+						rem;
+
+		is_neg1 = LLVMBuildICmp(builder, LLVMIntEQ, rhs,
+							    LLVMConstInt(int_type, (uint64) -1, true),
+							    "mod.isneg1");
+		safe_rhs = LLVMBuildSelect(builder, is_neg1,
+								   LLVMConstInt(int_type, 1, false), rhs,
+								   "mod.safe.rhs");
+		rem = LLVMBuildSRem(builder, lhs, safe_rhs, "mod.result");
+		result = LLVMBuildSelect(builder, is_neg1,
+								 LLVMConstInt(int_type, 0, false), rem,
+								 "mod.val");
 	}
 
 	{
@@ -2681,6 +2706,7 @@ uplpgsql_compile_expr_fmgr_full(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 				LLVMTypeRef	fn_type;
 				ListCell   *lc;
 				int			argidx;
+				LLVMValueRef *arg_isnulls;
 
 				if (IsA(expr, OpExpr))
 				{
@@ -2826,6 +2852,8 @@ uplpgsql_compile_expr_fmgr_full(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 				}
 
 				/* Fill in argument values and isnull flags */
+				arg_isnulls = (LLVMValueRef *)
+					palloc(sizeof(LLVMValueRef) * (nargs > 0 ? nargs : 1));
 				argidx = 0;
 				foreach(lc, args)
 				{
@@ -2834,19 +2862,37 @@ uplpgsql_compile_expr_fmgr_full(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 					LLVMValueRef arg_isnull;
 					uint64		arg_off;
 
-					arg_datum = fmgr_load_arg_datum(ctx, arg_expr, estate_ref);
-					arg_isnull = fmgr_load_arg_isnull(ctx, arg_expr,
-													  estate_ref);
+					/*
+					 * Compile the argument once, taking its value and its
+					 * nullness together.
+					 *
+					 * Going through _full() rather than the two loaders is
+					 * what makes a nested call's NULL visible here: for a
+					 * Const/Param/RelabelType it delegates to exactly the same
+					 * loaders as before, but for a sub-expression it returns
+					 * the isnull that expression actually computed.
+					 * fmgr_load_arg_isnull() answers a constant "not null" for
+					 * those, so abs(int4larger(NULL, NULL)) called the strict
+					 * int4abs with a bogus not-null argument and produced 0
+					 * where SQL says NULL.
+					 *
+					 * Keep each isnull for the STRICT check below, which needs
+					 * them again; recomputing would compile every argument a
+					 * second time.
+					 */
+					arg_datum = uplpgsql_compile_expr_fmgr_full(ctx, arg_expr,
+																estate_ref,
+																&arg_isnull);
 
 					/*
-					 * fmgr_load_arg_datum recurses into
-					 * uplpgsql_compile_expr_fmgr for sub-expressions, which
-					 * returns NULL for anything it cannot compile.  Storing
-					 * that NULL would dereference it inside LLVM; bail out
+					 * _full() returns NULL for anything it cannot compile.
+					 * Storing that would dereference it inside LLVM; bail out
 					 * instead and let the caller fall back to Tier 3.
 					 */
 					if (arg_datum == NULL || arg_isnull == NULL)
 						return NULL;
+
+					arg_isnulls[argidx] = arg_isnull;
 
 					/* args[argidx].value */
 					arg_off = OFF_FCI_ARGS + SIZE_NULLABLE_DATUM * argidx
@@ -2899,16 +2945,20 @@ uplpgsql_compile_expr_fmgr_full(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 					 */
 					{
 						LLVMValueRef any_null = LLVMConstInt(i1, 0, false);
+						int			 ai;
 
-						foreach(lc, args)
-						{
-							Expr *ae = (Expr *) lfirst(lc);
-							LLVMValueRef ainull = fmgr_load_arg_isnull(ctx, ae,
-																	   estate_ref);
-
-							any_null = LLVMBuildOr(builder, any_null, ainull,
+						/*
+						 * Reuse the isnull each argument already computed.
+						 * Re-deriving them with fmgr_load_arg_isnull() would
+						 * both recompile every argument and reintroduce the
+						 * constant "not null" answer for nested calls, which
+						 * is what let a strict function run on a NULL.
+						 */
+						for (ai = 0; ai < nargs; ai++)
+							any_null = LLVMBuildOr(builder, any_null,
+												   arg_isnulls[ai],
 												   "fmgr.strict.ornull");
-						}
+
 						LLVMBuildCondBr(builder, any_null, skip_bb, call_bb);
 					}
 

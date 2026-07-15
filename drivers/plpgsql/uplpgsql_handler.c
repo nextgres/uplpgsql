@@ -47,6 +47,7 @@
  */
 #include "upl_common.h"
 
+#include "access/xact.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/event_trigger.h"
@@ -400,6 +401,26 @@ uplpgsql_call_handler(PG_FUNCTION_ARGS)
 			 */
 			if (!uplpgsql_enable_jit_heuristic || uplpgsql_should_jit(func))
 			{
+				MemoryContext	oldcontext = CurrentMemoryContext;
+				ResourceOwner	oldowner = CurrentResourceOwner;
+
+				/*
+				 * Compile inside an internal subtransaction.
+				 *
+				 * Compilation can elog(ERROR) — an unsupported construct, an
+				 * expression whose plan will not prepare, an LLVM verification
+				 * failure — and we intend to catch that and fall back to the
+				 * interpreter.  Catching an arbitrary error and carrying on is
+				 * only safe when a subtransaction restores the memory context,
+				 * resource owner, buffer pins and syscache references;
+				 * otherwise the "graceful fallback" leaks whatever the failed
+				 * compile was holding.  That is not hypothetical: a simple
+				 * CASE over a non-integer value fails to plan at compile time
+				 * and leaked syscache references on every such function.
+				 */
+				BeginInternalSubTransaction(NULL);
+				MemoryContextSwitchTo(oldcontext);
+
 				PG_TRY();
 				{
 					jitfunc = uplpgsql_compile_function(func);
@@ -408,13 +429,25 @@ uplpgsql_call_handler(PG_FUNCTION_ARGS)
 									func->cfunc.fn_tid,
 									func,
 									(UPL_func *) jitfunc);
+
+					/* Success — commit the subtransaction. */
+					ReleaseCurrentSubTransaction();
+					MemoryContextSwitchTo(oldcontext);
+					CurrentResourceOwner = oldowner;
+
 					elog(LOG, "uplpgsql: JIT compiled function %s (oid %u)",
 						 func->fn_signature, func->fn_oid);
 				}
 				PG_CATCH();
 				{
+					/* Report the failure, then roll the subtransaction back. */
+					MemoryContextSwitchTo(oldcontext);
 					EmitErrorReport();
 					FlushErrorState();
+					RollbackAndReleaseCurrentSubTransaction();
+					MemoryContextSwitchTo(oldcontext);
+					CurrentResourceOwner = oldowner;
+
 					jitfunc = NULL;
 					elog(LOG, "uplpgsql: JIT compilation failed for %s, "
 						 "using interpreter",

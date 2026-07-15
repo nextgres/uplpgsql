@@ -347,16 +347,15 @@ uplpgsql_rt_assign_int(UPLpgSQL_exec_state *estate, int dno, int32 value)
 	UPLpgSQL_execstate *plstate = estate->uplpgsql_estate;
 	UPLpgSQL_var *var = (UPLpgSQL_var *) plstate->datums[dno];
 
-	/* Free any existing pass-by-ref value */
-	if (var->freeval)
-	{
-		pfree(DatumGetPointer(var->value));
-		var->freeval = false;
-	}
-
-	var->value = Int32GetDatum(value);
-	var->isnull = false;
-	var->freeval = false;
+	/*
+	 * As in uplpgsql_rt_assign_null: release the old value through
+	 * assign_simple_var so a read/write expanded object is deleted rather than
+	 * pfree'd header-first.  Only reached for pass-by-value int targets today
+	 * (loop counters), where the old value cannot be expanded — but the raw
+	 * free was latent breakage waiting for a caller with a wider target, and
+	 * the detoast branch is inert here anyway (typlen != -1).
+	 */
+	assign_simple_var(plstate, var, Int32GetDatum(value), false, false);
 }
 
 /*
@@ -398,15 +397,18 @@ uplpgsql_rt_assign_null(UPLpgSQL_exec_state *estate, int dno)
 	UPLpgSQL_execstate *plstate = estate->uplpgsql_estate;
 	UPLpgSQL_var *var = (UPLpgSQL_var *) plstate->datums[dno];
 
-	if (var->freeval)
-	{
-		pfree(DatumGetPointer(var->value));
-		var->freeval = false;
-	}
-
-	var->value = (Datum) 0;
-	var->isnull = true;
-	var->freeval = false;
+	/*
+	 * Go through assign_simple_var rather than pfree'ing var->value directly.
+	 *
+	 * A read/write expanded object (an expanded array or record) must be
+	 * released with DeleteExpandedObject: a bare pfree frees only the
+	 * ExpandedObjectHeader chunk, leaking the object's private context and
+	 * corrupting the allocator.  This is reachable — CASE clears its temporary
+	 * search variable through here, and that variable can hold an expanded
+	 * value.  assign_simple_var also cancels any promise on the variable,
+	 * which the open-coded version skipped.
+	 */
+	assign_simple_var(plstate, var, (Datum) 0, true, false);
 }
 
 /*
@@ -1101,6 +1103,19 @@ uplpgsql_rt_exception_try_exit(UPLpgSQL_exec_state *estate, void *frame_ptr)
 
 	/* Restore eval_econtext to the outer one */
 	plstate->eval_econtext = frame->old_eval_econtext;
+
+	/*
+	 * Terminal exit for this block, so release the frame.  Upstream PL/pgSQL
+	 * has nothing to free here — it uses a stack-local sigjmp_buf via PG_TRY —
+	 * but the JIT decomposition has to heap-allocate it, and a loop body that
+	 * enters an exception block would otherwise accumulate one frame per
+	 * iteration for the whole call.
+	 *
+	 * Safe here: PG_exception_stack was restored above, so the sigjmp_buf
+	 * inside the frame is no longer a longjmp target, and we have switched
+	 * back to the context the frame was allocated in.
+	 */
+	pfree(frame);
 }
 
 /*
@@ -1229,6 +1244,13 @@ uplpgsql_rt_exception_handler_done(UPLpgSQL_exec_state *estate,
 	/* Restore stmt_mcontext stack and release the error data */
 	pop_stmt_mcontext(plstate);
 	MemoryContextReset(frame->stmt_mcontext);
+
+	/*
+	 * Terminal exit for a handled block; release the frame.  The frame lives
+	 * in the function's context, not in stmt_mcontext, so the reset above has
+	 * not already freed it.
+	 */
+	pfree(frame);
 }
 
 /*
@@ -1249,6 +1271,13 @@ uplpgsql_rt_exception_rethrow(UPLpgSQL_exec_state *estate, void *frame_ptr)
 
 	/* Restore stmt_mcontext and rethrow */
 	pop_stmt_mcontext(plstate);
+
+	/*
+	 * Terminal exit for an unhandled block.  Free the frame before
+	 * ReThrowError longjmps out of here — nothing below this point returns.
+	 * edata lives in stmt_mcontext, not in the frame, so it is unaffected.
+	 */
+	pfree(frame);
 
 	ReThrowError(edata);
 }

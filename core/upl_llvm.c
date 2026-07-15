@@ -357,11 +357,27 @@ upl_jit_compile(LLVMModuleRef module, LLVMContextRef context,
 		}
 
 		/*
+		 * LLVMParseBitcodeInContext2 reads through a non-owning
+		 * MemoryBufferRef, so the buffer is ours to release.  The error path
+		 * above already did; do it here too or every compile leaks the whole
+		 * serialized module.
+		 */
+		LLVMDisposeMemoryBuffer(buf);
+
+		/*
 		 * Wrap the fresh context in a ThreadSafeContext (takes ownership of
 		 * new_ctx), then wrap the module (takes ownership of new_module).
 		 */
 		ts_ctx = LLVMOrcCreateNewThreadSafeContextFromLLVMContext(new_ctx);
 		ts_mod = LLVMOrcCreateNewThreadSafeModule(new_module, ts_ctx);
+
+		/*
+		 * The ThreadSafeModule holds its own reference to the context, and
+		 * ownership of the TSCtx handle stays with us, so this handle is now
+		 * redundant.  Dispose it here rather than only on the error path
+		 * below — the context itself survives, held by ts_mod.
+		 */
+		LLVMOrcDisposeThreadSafeContext(ts_ctx);
 
 		/* Dispose original module (we have the copy now) */
 		LLVMDisposeModule(module);
@@ -376,7 +392,7 @@ upl_jit_compile(LLVMModuleRef module, LLVMContextRef context,
 		char *pstr = pstrdup(msg);
 
 		LLVMDisposeErrorMessage(msg);
-		LLVMOrcDisposeThreadSafeContext(ts_ctx);
+		/* ts_ctx is already disposed; AddLLVMIRModule consumes ts_mod even on error */
 		elog(ERROR, "upl: failed to add module to OrcJIT: %s", pstr);
 	}
 

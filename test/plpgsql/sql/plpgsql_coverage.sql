@@ -326,6 +326,177 @@ END; $$;
 SELECT cov_lax_multi();
 
 --
+-- STRICT/NULL propagation out of a nested Tier-2 call.
+--
+-- fmgr_load_arg_isnull() used to answer a constant "not null" for any argument
+-- that was not a Const/Param/RelabelType, so a NULL produced by a nested call
+-- was invisible to the enclosing strict function.
+--
+CREATE FUNCTION cov_nested_null() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE a int; b int; r int;
+BEGIN
+  r := abs(int4larger(a, b));
+  RETURN coalesce(r::text, 'NULL');
+END; $$;
+SELECT cov_nested_null();
+
+CREATE FUNCTION cov_nested_null2() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE a int; r int;
+BEGIN
+  r := abs(int4larger(a, 7));
+  RETURN coalesce(r::text, 'NULL');
+END; $$;
+SELECT cov_nested_null2();
+
+CREATE FUNCTION cov_nested_deep() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE a int; r int;
+BEGIN
+  r := abs(int4larger(int4smaller(a, 1), 2));
+  RETURN coalesce(r::text, 'NULL');
+END; $$;
+SELECT cov_nested_deep();
+
+-- the same shapes with no NULL must still compute
+CREATE FUNCTION cov_nested_ok() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE a int := 3; r int;
+BEGIN
+  r := abs(int4larger(a, 7));
+  RETURN r::text;
+END; $$;
+SELECT cov_nested_ok();
+
+CREATE FUNCTION cov_nested_deep_ok() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE a int := 5; r int;
+BEGIN
+  r := abs(int4larger(int4smaller(a, 1), 2));
+  RETURN r::text;
+END; $$;
+SELECT cov_nested_deep_ok();
+
+-- a nested NULL reaching a boolean condition
+CREATE FUNCTION cov_nested_null_cond() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE a int; b int;
+BEGIN
+  IF abs(int4larger(a, b)) > 0 THEN RETURN 'T'; ELSE RETURN 'F-or-N'; END IF;
+END; $$;
+SELECT cov_nested_null_cond();
+
+--
+-- Every exit path of a BEGIN ... EXCEPTION block.
+--
+-- The exception frame is heap-allocated on entry (upstream uses a stack-local
+-- sigjmp_buf via PG_TRY and has nothing to free), so exactly one terminal
+-- helper must release it: try_exit, handler_done or rethrow.  A RETURN inside
+-- a handler body has to reach handler_done too, or it bypasses the cleanup.
+--
+CREATE FUNCTION cov_exc_normal() RETURNS int LANGUAGE uplpgsql AS $$
+DECLARE x int := 0;
+BEGIN
+  BEGIN x := 1; EXCEPTION WHEN others THEN x := 9; END;
+  RETURN x;
+END; $$;
+SELECT cov_exc_normal();
+
+CREATE FUNCTION cov_exc_caught() RETURNS int LANGUAGE uplpgsql AS $$
+DECLARE x int := 0;
+BEGIN
+  BEGIN RAISE EXCEPTION 'e'; EXCEPTION WHEN others THEN x := 9; END;
+  RETURN x;
+END; $$;
+SELECT cov_exc_caught();
+
+CREATE FUNCTION cov_exc_ret_try() RETURNS text LANGUAGE uplpgsql AS $$
+BEGIN
+  BEGIN RETURN 'ret-in-try'; EXCEPTION WHEN others THEN RETURN 'h'; END;
+END; $$;
+SELECT cov_exc_ret_try();
+
+-- RETURN inside a handler: must still run HANDLER_DONE
+CREATE FUNCTION cov_exc_ret_handler() RETURNS text LANGUAGE uplpgsql AS $$
+BEGIN
+  BEGIN
+    RAISE EXCEPTION 'e';
+  EXCEPTION WHEN others THEN
+    RETURN 'ret-in-handler';
+  END;
+  RETURN 'fell-through';
+END; $$;
+SELECT cov_exc_ret_handler();
+
+CREATE FUNCTION cov_exc_rethrow() RETURNS text LANGUAGE uplpgsql AS $$
+BEGIN
+  BEGIN
+    BEGIN RAISE EXCEPTION division_by_zero;
+    EXCEPTION WHEN unique_violation THEN RETURN 'wrong'; END;
+  EXCEPTION WHEN others THEN RETURN 'outer-caught';
+  END;
+END; $$;
+SELECT cov_exc_rethrow();
+
+CREATE FUNCTION cov_exc_reraise() RETURNS text LANGUAGE uplpgsql AS $$
+BEGIN
+  BEGIN
+    BEGIN RAISE EXCEPTION 'inner';
+    EXCEPTION WHEN others THEN RAISE; END;
+  EXCEPTION WHEN others THEN RETURN 'reraised';
+  END;
+END; $$;
+SELECT cov_exc_reraise();
+
+CREATE FUNCTION cov_exc_nested() RETURNS int LANGUAGE uplpgsql AS $$
+DECLARE x int := 0;
+BEGIN
+  BEGIN
+    BEGIN RAISE EXCEPTION 'e'; EXCEPTION WHEN others THEN x := 1; END;
+    x := x + 1;
+  EXCEPTION WHEN others THEN x := 99;
+  END;
+  RETURN x;
+END; $$;
+SELECT cov_exc_nested();
+
+-- repeated entry must not accumulate frames (or double-free them)
+CREATE FUNCTION cov_exc_loop(n int) RETURNS int LANGUAGE uplpgsql AS $$
+DECLARE i int; c int := 0;
+BEGIN
+  FOR i IN 1..n LOOP
+    BEGIN RAISE EXCEPTION 'e'; EXCEPTION WHEN others THEN c := c + 1; END;
+  END LOOP;
+  RETURN c;
+END; $$;
+SELECT cov_exc_loop(2000);
+
+CREATE FUNCTION cov_exc_loop_ret(n int) RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE i int;
+BEGIN
+  FOR i IN 1..n LOOP
+    BEGIN
+      RAISE EXCEPTION 'e';
+    EXCEPTION WHEN others THEN
+      IF i = 500 THEN RETURN 'exit-at-500'; END IF;
+    END;
+  END LOOP;
+  RETURN 'no';
+END; $$;
+SELECT cov_exc_loop_ret(2000);
+
+DROP FUNCTION cov_nested_null();
+DROP FUNCTION cov_nested_null2();
+DROP FUNCTION cov_nested_deep();
+DROP FUNCTION cov_nested_ok();
+DROP FUNCTION cov_nested_deep_ok();
+DROP FUNCTION cov_nested_null_cond();
+DROP FUNCTION cov_exc_normal();
+DROP FUNCTION cov_exc_caught();
+DROP FUNCTION cov_exc_ret_try();
+DROP FUNCTION cov_exc_ret_handler();
+DROP FUNCTION cov_exc_rethrow();
+DROP FUNCTION cov_exc_reraise();
+DROP FUNCTION cov_exc_nested();
+DROP FUNCTION cov_exc_loop(int);
+DROP FUNCTION cov_exc_loop_ret(int);
+
+--
 -- Event triggers (interpreter-only dispatch: no JIT path)
 --
 CREATE FUNCTION cov_evt() RETURNS event_trigger LANGUAGE uplpgsql AS $$
