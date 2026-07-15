@@ -992,6 +992,108 @@ native_array_check_stmts(UPLpgSQL_function *func, List *stmts,
 }
 
 /*
+ * Mark, in sized[], any array variable that is given a size by an array_fill()
+ * assignment (x := array_fill(v, ARRAY[n])) anywhere in the body.  A native
+ * array is fixed-size flat memory that cannot auto-extend on an out-of-bounds
+ * subscript write the way a PostgreSQL array does; array_fill (or a sized
+ * default, checked by the caller) is the only thing that establishes its
+ * length.  An array that is only ever grown by subscript assignment
+ * (e.g. "a int[]" then "a[i] := ...") must not be taken native.
+ */
+static void
+native_array_mark_sized(List *stmts, bool *sized, int ndatums)
+{
+	ListCell *lc;
+
+	if (stmts == NIL)
+		return;
+
+	foreach(lc, stmts)
+	{
+		UPLpgSQL_stmt *stmt = lfirst(lc);
+
+		switch (stmt->cmd_type)
+		{
+			case UPLPGSQL_STMT_ASSIGN:
+				{
+					UPLpgSQL_stmt_assign *a = (UPLpgSQL_stmt_assign *) stmt;
+
+					if (a->varno >= 0 && a->varno < ndatums &&
+						a->expr != NULL && a->expr->query != NULL &&
+						strstr(a->expr->query, "array_fill") != NULL)
+						sized[a->varno] = true;
+				}
+				break;
+			case UPLPGSQL_STMT_BLOCK:
+				{
+					UPLpgSQL_stmt_block *b = (UPLpgSQL_stmt_block *) stmt;
+					ListCell *e;
+
+					native_array_mark_sized(b->body, sized, ndatums);
+					if (b->exceptions)
+						foreach(e, b->exceptions->exc_list)
+							native_array_mark_sized(
+								((UPLpgSQL_exception *) lfirst(e))->action,
+								sized, ndatums);
+				}
+				break;
+			case UPLPGSQL_STMT_IF:
+				{
+					UPLpgSQL_stmt_if *i = (UPLpgSQL_stmt_if *) stmt;
+					ListCell *e;
+
+					native_array_mark_sized(i->then_body, sized, ndatums);
+					foreach(e, i->elsif_list)
+						native_array_mark_sized(
+							((UPLpgSQL_if_elsif *) lfirst(e))->stmts,
+							sized, ndatums);
+					native_array_mark_sized(i->else_body, sized, ndatums);
+				}
+				break;
+			case UPLPGSQL_STMT_CASE:
+				{
+					UPLpgSQL_stmt_case *c = (UPLpgSQL_stmt_case *) stmt;
+					ListCell *e;
+
+					foreach(e, c->case_when_list)
+						native_array_mark_sized(
+							((UPLpgSQL_case_when *) lfirst(e))->stmts,
+							sized, ndatums);
+					native_array_mark_sized(c->else_stmts, sized, ndatums);
+				}
+				break;
+			case UPLPGSQL_STMT_LOOP:
+				native_array_mark_sized(
+					((UPLpgSQL_stmt_loop *) stmt)->body, sized, ndatums);
+				break;
+			case UPLPGSQL_STMT_WHILE:
+				native_array_mark_sized(
+					((UPLpgSQL_stmt_while *) stmt)->body, sized, ndatums);
+				break;
+			case UPLPGSQL_STMT_FORI:
+				native_array_mark_sized(
+					((UPLpgSQL_stmt_fori *) stmt)->body, sized, ndatums);
+				break;
+			case UPLPGSQL_STMT_FORS:
+			case UPLPGSQL_STMT_DYNFORS:
+				native_array_mark_sized(
+					((UPLpgSQL_stmt_fors *) stmt)->body, sized, ndatums);
+				break;
+			case UPLPGSQL_STMT_FORC:
+				native_array_mark_sized(
+					((UPLpgSQL_stmt_forc *) stmt)->body, sized, ndatums);
+				break;
+			case UPLPGSQL_STMT_FOREACH_A:
+				native_array_mark_sized(
+					((UPLpgSQL_stmt_foreach_a *) stmt)->body, sized, ndatums);
+				break;
+			default:
+				break;
+		}
+	}
+}
+
+/*
  * Main escape analysis entry point for native local arrays.
  *
  * Three-step process:
@@ -1060,6 +1162,27 @@ uplpgsql_analyze_native_arrays(UPLpgSQL_compile_ctx *ctx,
 
 	/* Step 2: Walk AST and disqualify arrays that escape */
 	native_array_check_stmts(func, func->action->body, candidates, ndatums);
+
+	/*
+	 * Step 2b: Disqualify any candidate that is not given a fixed size.  A
+	 * native array cannot auto-extend on an out-of-bounds subscript write, so
+	 * an array grown by subscript assignment from empty (no sized default and
+	 * no array_fill) must use the normal PostgreSQL array path.  A candidate
+	 * is sized if it has a default value or is assigned array_fill() somewhere.
+	 */
+	{
+		bool	   *sized = palloc0(sizeof(bool) * ndatums);
+
+		native_array_mark_sized(func->action->body, sized, ndatums);
+
+		for (i = 0; i < ndatums; i++)
+		{
+			if (candidates[i] && !sized[i] &&
+				((UPLpgSQL_var *) func->datums[i])->default_val == NULL)
+				candidates[i] = false;
+		}
+		pfree(sized);
+	}
 
 	/* Step 3: Build native_arrays list from survivors */
 	count = 0;
