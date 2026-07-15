@@ -70,6 +70,8 @@
  */
 #include "upl_common.h"
 
+#include <math.h>				/* INFINITY */
+
 /*
  * Convenience macros for accessing PL/pgSQL-specific lang_data fields.
  */
@@ -1009,6 +1011,22 @@ uplpgsql_rt_div_zero(void)
 			 errmsg("division by zero")));
 }
 
+UPLPGSQL_RT_EXPORT void
+uplpgsql_rt_float_overflow(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+			 errmsg("value out of range: overflow")));
+}
+
+UPLPGSQL_RT_EXPORT void
+uplpgsql_rt_float_underflow(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+			 errmsg("value out of range: underflow")));
+}
+
 /*
  * Emit a call to a no-arg error runtime function, followed by unreachable.
  *
@@ -1206,6 +1224,69 @@ emit_int_abs(UPLpgSQL_compile_ctx *ctx, LLVMValueRef arg,
 	return LLVMBuildSelect(builder, cmp, arg, neg, "abs.val");
 }
 
+/*
+ * Emit an isinf(x) test for a float8 value (i1 result).
+ */
+static LLVMValueRef
+emit_float8_isinf(UPLpgSQL_compile_ctx *ctx, LLVMValueRef x)
+{
+	LLVMBuilderRef	builder = ctx->builder;
+	LLVMTypeRef		dbl = ctx->types[UPLPGSQL_DOUBLE];
+	LLVMValueRef	is_p, is_n;
+
+	is_p = LLVMBuildFCmp(builder, LLVMRealOEQ, x,
+						 LLVMConstReal(dbl, (double) INFINITY), "isinf.p");
+	is_n = LLVMBuildFCmp(builder, LLVMRealOEQ, x,
+						 LLVMConstReal(dbl, (double) -INFINITY), "isinf.n");
+	return LLVMBuildOr(builder, is_p, is_n, "isinf");
+}
+
+/*
+ * Emit PostgreSQL's check_float8_val() for a computed float8 result.
+ *
+ * PostgreSQL raises "value out of range: overflow" when a float8 operation
+ * produces an infinity that the inputs do not justify, and "underflow" when
+ * it produces zero from non-zero inputs.  inf_ok / zero_ok are i1 values that
+ * say whether an infinite / zero result is legitimate for these inputs.
+ * Returns the (checked) result value.
+ */
+static LLVMValueRef
+emit_float8_checked(UPLpgSQL_compile_ctx *ctx, LLVMValueRef result,
+					LLVMValueRef inf_ok, LLVMValueRef zero_ok)
+{
+	LLVMBuilderRef		builder = ctx->builder;
+	LLVMTypeRef			dbl = ctx->types[UPLPGSQL_DOUBLE];
+	LLVMValueRef		isinf, iszero, need_ovf, need_unf;
+	LLVMBasicBlockRef	ovf_bb, cont1_bb, unf_bb, cont2_bb;
+
+	/* overflow: isinf(result) && !inf_ok */
+	isinf = emit_float8_isinf(ctx, result);
+	need_ovf = LLVMBuildAnd(builder, isinf,
+							LLVMBuildNot(builder, inf_ok, "inf.notok"),
+							"need.ovf");
+	ovf_bb = expr_append_block(ctx, "f8.ovf");
+	cont1_bb = expr_append_block(ctx, "f8.cont1");
+	LLVMBuildCondBr(builder, need_ovf, ovf_bb, cont1_bb);
+	LLVMPositionBuilderAtEnd(builder, ovf_bb);
+	emit_error_call(ctx, "uplpgsql_rt_float_overflow");
+	LLVMPositionBuilderAtEnd(builder, cont1_bb);
+
+	/* underflow: result == 0 && !zero_ok */
+	iszero = LLVMBuildFCmp(builder, LLVMRealOEQ, result,
+						   LLVMConstReal(dbl, 0.0), "iszero");
+	need_unf = LLVMBuildAnd(builder, iszero,
+							LLVMBuildNot(builder, zero_ok, "zero.notok"),
+							"need.unf");
+	unf_bb = expr_append_block(ctx, "f8.unf");
+	cont2_bb = expr_append_block(ctx, "f8.cont2");
+	LLVMBuildCondBr(builder, need_unf, unf_bb, cont2_bb);
+	LLVMPositionBuilderAtEnd(builder, unf_bb);
+	emit_error_call(ctx, "uplpgsql_rt_float_underflow");
+	LLVMPositionBuilderAtEnd(builder, cont2_bb);
+
+	return result;
+}
+
 
 /* ================================================================
  * Expression compilation — unified Expr tree → LLVM IR
@@ -1363,18 +1444,70 @@ uplpgsql_compile_expr_datum(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 							(uint64) PG_INT64_MIN);
 					}
 
-					/* --- float8 arithmetic --- */
-					if (fid == F_FLOAT8PL)
-						return LLVMBuildFAdd(builder, lhs, rhs, "f8.add");
-					if (fid == F_FLOAT8MI)
-						return LLVMBuildFSub(builder, lhs, rhs, "f8.sub");
-					if (fid == F_FLOAT8MUL)
-						return LLVMBuildFMul(builder, lhs, rhs, "f8.mul");
-					if (fid == F_FLOAT8DIV)
+					/*
+					 * --- float8 arithmetic ---
+					 *
+					 * Mirror PostgreSQL's float8pl/mi/mul/div: after the IEEE
+					 * operation, apply check_float8_val (overflow to infinity,
+					 * underflow to zero), and raise division_by_zero for a zero
+					 * divisor.  An infinite result is legitimate only if an
+					 * input was already infinite; a zero result is legitimate
+					 * for +/-/* (always) and for / only if the numerator was 0.
+					 */
+					if (fid == F_FLOAT8PL || fid == F_FLOAT8MI ||
+						fid == F_FLOAT8MUL || fid == F_FLOAT8DIV)
 					{
-						/* float8 division: PG checks for zero and infinity */
-						/* For now, just emit fdiv — matches IEEE 754 semantics */
-						return LLVMBuildFDiv(builder, lhs, rhs, "f8.div");
+						LLVMValueRef	res, inf_ok, zero_ok;
+						LLVMValueRef	zero = LLVMConstReal(dbl, 0.0);
+						LLVMValueRef	true_i1 =
+							LLVMConstInt(ctx->types[UPLPGSQL_INT1], 1, false);
+
+						inf_ok = LLVMBuildOr(builder,
+											 emit_float8_isinf(ctx, lhs),
+											 emit_float8_isinf(ctx, rhs),
+											 "f8.inf.ok");
+
+						if (fid == F_FLOAT8PL)
+						{
+							res = LLVMBuildFAdd(builder, lhs, rhs, "f8.add");
+							return emit_float8_checked(ctx, res, inf_ok, true_i1);
+						}
+						if (fid == F_FLOAT8MI)
+						{
+							res = LLVMBuildFSub(builder, lhs, rhs, "f8.sub");
+							return emit_float8_checked(ctx, res, inf_ok, true_i1);
+						}
+						if (fid == F_FLOAT8MUL)
+						{
+							res = LLVMBuildFMul(builder, lhs, rhs, "f8.mul");
+							/* zero result ok iff an input was zero */
+							zero_ok = LLVMBuildOr(builder,
+								LLVMBuildFCmp(builder, LLVMRealOEQ, lhs, zero,
+											  "f8.lz"),
+								LLVMBuildFCmp(builder, LLVMRealOEQ, rhs, zero,
+											  "f8.rz"),
+								"f8.zero.ok");
+							return emit_float8_checked(ctx, res, inf_ok, zero_ok);
+						}
+						/* F_FLOAT8DIV */
+						{
+							LLVMBasicBlockRef zbb, okbb;
+							LLVMValueRef	div_zero;
+
+							div_zero = LLVMBuildFCmp(builder, LLVMRealOEQ, rhs,
+													 zero, "f8.divisor.zero");
+							zbb = expr_append_block(ctx, "f8.divzero");
+							okbb = expr_append_block(ctx, "f8.divok");
+							LLVMBuildCondBr(builder, div_zero, zbb, okbb);
+							LLVMPositionBuilderAtEnd(builder, zbb);
+							emit_error_call(ctx, "uplpgsql_rt_div_zero");
+							LLVMPositionBuilderAtEnd(builder, okbb);
+							res = LLVMBuildFDiv(builder, lhs, rhs, "f8.div");
+							/* zero result ok iff numerator was zero */
+							zero_ok = LLVMBuildFCmp(builder, LLVMRealOEQ, lhs,
+													zero, "f8.num.zero");
+							return emit_float8_checked(ctx, res, inf_ok, zero_ok);
+						}
 					}
 				}
 
