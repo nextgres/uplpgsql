@@ -551,6 +551,74 @@ uplpgsql_emit_store_var_datum(UPLpgSQL_compile_ctx *ctx,
 	LLVMBuildStore(builder, LLVMConstInt(i8, 0, false), gep);
 }
 
+/*
+ * Emit IR to store SQL NULL into a scalar variable: isnull=true, value=0,
+ * freeval=false.  Used by the Tier-1 assignment path when an operand is NULL.
+ *
+ * Only correct for pass-by-value scalar targets (int4/int8/float8), where the
+ * old value is never freeval-owned, so there is nothing to free.
+ */
+static void
+uplpgsql_emit_store_var_null(UPLpgSQL_compile_ctx *ctx,
+							 LLVMValueRef estate_ref, int dno)
+{
+	LLVMBuilderRef	builder = ctx->builder;
+	LLVMTypeRef		i8 = ctx->types[UPLPGSQL_INT8];
+	LLVMTypeRef		i64 = ctx->types[UPLPGSQL_INT64];
+	LLVMTypeRef		ptr = ctx->types[UPLPGSQL_PTR];
+	LLVMValueRef	off, gep, plstate, datums, datum;
+
+	off = LLVMConstInt(i64, OFF_ESTATE_PLSTATE, false);
+	gep = LLVMBuildGEP2(builder, i8, estate_ref, &off, 1, "sn.plstate.ptr");
+	plstate = LLVMBuildLoad2(builder, ptr, gep, "sn.plstate");
+
+	off = LLVMConstInt(i64, OFF_EXECSTATE_DATUMS, false);
+	gep = LLVMBuildGEP2(builder, i8, plstate, &off, 1, "sn.datums.ptr");
+	datums = LLVMBuildLoad2(builder, ptr, gep, "sn.datums");
+
+	off = LLVMConstInt(i64, dno, false);
+	gep = LLVMBuildGEP2(builder, ptr, datums, &off, 1, "sn.datum.slot");
+	datum = LLVMBuildLoad2(builder, ptr, gep, "sn.datum");
+
+	/* datum->value = 0 */
+	off = LLVMConstInt(i64, OFF_VAR_VALUE, false);
+	gep = LLVMBuildGEP2(builder, i8, datum, &off, 1, "sn.value.ptr");
+	LLVMBuildStore(builder, LLVMConstInt(i64, 0, false), gep);
+
+	/* datum->isnull = true */
+	off = LLVMConstInt(i64, OFF_VAR_ISNULL, false);
+	gep = LLVMBuildGEP2(builder, i8, datum, &off, 1, "sn.isnull.ptr");
+	LLVMBuildStore(builder, LLVMConstInt(i8, 1, false), gep);
+
+	/* datum->freeval = false */
+	off = LLVMConstInt(i64, OFF_VAR_FREEVAL, false);
+	gep = LLVMBuildGEP2(builder, i8, datum, &off, 1, "sn.freeval.ptr");
+	LLVMBuildStore(builder, LLVMConstInt(i8, 0, false), gep);
+}
+
+/*
+ * Collect the datum numbers (dno) of the PL/pgSQL variables read by an
+ * expression.  Variables appear in the parsed SQL tree as PARAM_EXTERN Params
+ * with paramid = dno + 1.  Used by the Tier-1 assignment path to test, at
+ * run time, whether any input is NULL.
+ */
+static bool
+uplpgsql_collect_param_dnos(Node *node, List **dnos)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Param))
+	{
+		Param	   *p = (Param *) node;
+
+		if (p->paramkind == PARAM_EXTERN && p->paramid > 0)
+			*dnos = list_append_unique_int(*dnos, p->paramid - 1);
+		return false;
+	}
+	return expression_tree_walker(node, uplpgsql_collect_param_dnos,
+								  (void *) dnos);
+}
+
 
 /* ================================================================
  * Expression preparation and analysis
@@ -2631,9 +2699,68 @@ uplpgsql_try_compile_assign(UPLpgSQL_compile_ctx *ctx,
 			 stmt->varno, stmt->expr->query);
 
 		estate_ref = LLVMGetParam(ctx->function, 0);
-		result = uplpgsql_compile_expr_datum(ctx, expr, estate_ref, &expr_class);
-		datum_val = native_to_datum(ctx, result, expr_class);
-		uplpgsql_emit_store_var_datum(ctx, estate_ref, stmt->varno, datum_val);
+
+		/*
+		 * NULL handling.  The native arithmetic below reads variable values
+		 * directly and cannot represent SQL NULL, so it would compute on the
+		 * stale/zero value of a NULL input and wrongly store a non-NULL result
+		 * (and, for a NULL divisor, could even trap).  All the operators on the
+		 * Tier-1 path are strict, so the result is NULL iff any input variable
+		 * is NULL.  OR the inputs' isnull flags and, at run time, store NULL
+		 * without evaluating the arithmetic when any input is NULL.
+		 */
+		{
+			LLVMBuilderRef	builder = ctx->builder;
+			List		   *dnos = NIL;
+			LLVMValueRef	any_null = NULL;
+			ListCell	   *lc;
+
+			uplpgsql_collect_param_dnos((Node *) expr, &dnos);
+			foreach(lc, dnos)
+			{
+				LLVMValueRef isn;
+
+				isn = uplpgsql_emit_load_param_isnull(ctx, estate_ref,
+													  lfirst_int(lc));
+				any_null = (any_null == NULL) ? isn
+					: LLVMBuildOr(builder, any_null, isn, "assign.anynull");
+			}
+
+			if (any_null == NULL)
+			{
+				/* No variable inputs — the result cannot be NULL. */
+				result = uplpgsql_compile_expr_datum(ctx, expr, estate_ref,
+													 &expr_class);
+				datum_val = native_to_datum(ctx, result, expr_class);
+				uplpgsql_emit_store_var_datum(ctx, estate_ref, stmt->varno,
+											  datum_val);
+			}
+			else
+			{
+				LLVMBasicBlockRef null_bb, calc_bb, done_bb;
+
+				null_bb = expr_append_block(ctx, "assign.null");
+				calc_bb = expr_append_block(ctx, "assign.calc");
+				done_bb = expr_append_block(ctx, "assign.done");
+				LLVMBuildCondBr(builder, any_null, null_bb, calc_bb);
+
+				/* Any input NULL → store NULL, skip the arithmetic. */
+				LLVMPositionBuilderAtEnd(builder, null_bb);
+				uplpgsql_emit_store_var_null(ctx, estate_ref, stmt->varno);
+				LLVMBuildBr(builder, done_bb);
+
+				/* All inputs non-NULL → compute and store the value. */
+				LLVMPositionBuilderAtEnd(builder, calc_bb);
+				result = uplpgsql_compile_expr_datum(ctx, expr, estate_ref,
+													 &expr_class);
+				datum_val = native_to_datum(ctx, result, expr_class);
+				uplpgsql_emit_store_var_datum(ctx, estate_ref, stmt->varno,
+											  datum_val);
+				LLVMBuildBr(builder, done_bb);
+
+				LLVMPositionBuilderAtEnd(builder, done_bb);
+			}
+		}
 		return true;
 	}
 
