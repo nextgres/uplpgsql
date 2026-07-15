@@ -3379,6 +3379,66 @@ standard_array_path:
 }
 
 /*
+ * Walker context: OR together the isnull flags of every PARAM_EXTERN variable
+ * read by an expression, emitting the loads.  any_null is NULL if the
+ * expression reads no variables.
+ */
+typedef struct bool_null_ctx
+{
+	UPLpgSQL_compile_ctx *ctx;
+	LLVMValueRef	estate_ref;
+	LLVMValueRef	any_null;
+} bool_null_ctx;
+
+static bool
+bool_null_walker(Node *node, bool_null_ctx *bc)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Param))
+	{
+		Param	   *p = (Param *) node;
+
+		if (p->paramkind == PARAM_EXTERN && p->paramid > 0)
+		{
+			LLVMValueRef isn = uplpgsql_emit_load_param_isnull(bc->ctx,
+															   bc->estate_ref,
+															   p->paramid - 1);
+
+			bc->any_null = (bc->any_null == NULL) ? isn
+				: LLVMBuildOr(bc->ctx->builder, bc->any_null, isn,
+							  "bool.anynull");
+		}
+		return false;
+	}
+	return expression_tree_walker(node, bool_null_walker, (void *) bc);
+}
+
+static LLVMValueRef
+emit_any_param_null(UPLpgSQL_compile_ctx *ctx, Node *node,
+					LLVMValueRef estate_ref)
+{
+	bool_null_ctx bc;
+
+	bc.ctx = ctx;
+	bc.estate_ref = estate_ref;
+	bc.any_null = NULL;
+	bool_null_walker(node, &bc);
+	return bc.any_null;
+}
+
+/* Does the expression contain an AND/OR/NOT (BoolExpr) node? */
+static bool
+bool_has_boolop_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, BoolExpr))
+		return true;
+	return expression_tree_walker(node, bool_has_boolop_walker, context);
+}
+
+/*
  * Try to compile a boolean expression as native comparisons or fmgr bypass.
  *
  * Tier 1: native LLVM icmp/fcmp for known int/float comparisons
@@ -3403,10 +3463,35 @@ uplpgsql_try_compile_bool(UPLpgSQL_compile_ctx *ctx,
 	tc = uplpgsql_classify_expr(expr);
 	if (tc == EXPR_TYPE_BOOL)
 	{
+		LLVMValueRef	any_null;
+
+		/*
+		 * AND/OR/NOT need SQL three-valued logic (e.g. NOT NULL is NULL, not
+		 * TRUE), which the plain-i1 inlined path cannot represent.  Leave
+		 * those to the interpreter.
+		 */
+		if (bool_has_boolop_walker((Node *) expr, NULL))
+			return false;
+
 		elog(DEBUG1, "uplpgsql: inlining bool expression: %s", expr_node->query);
 
 		estate_ref = LLVMGetParam(ctx->function, 0);
 		*result_out = uplpgsql_compile_expr_bool(ctx, expr, estate_ref);
+
+		/*
+		 * A leaf comparison (or bool variable) reads variable values directly
+		 * and cannot represent NULL, so a NULL input yields a garbage result
+		 * (notably NULL = NULL comparing equal).  In a condition, UNKNOWN is
+		 * treated as false: mask the result to false when any input variable
+		 * is NULL.  Safe because AND/OR/NOT were excluded above, so there is
+		 * no NOT to invert the collapse.
+		 */
+		any_null = emit_any_param_null(ctx, (Node *) expr, estate_ref);
+		if (any_null != NULL)
+			*result_out = LLVMBuildAnd(ctx->builder, *result_out,
+				LLVMBuildNot(ctx->builder, any_null, "bool.notnull"),
+				"bool.masked");
+
 		return true;
 	}
 
