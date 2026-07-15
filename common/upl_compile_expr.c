@@ -2651,13 +2651,52 @@ uplpgsql_try_compile_assign(UPLpgSQL_compile_ctx *ctx,
 
 		if (target_var->datatype->typbyval)
 		{
-			datum_val = uplpgsql_compile_expr_fmgr(ctx, expr, estate_ref);
+			LLVMValueRef	isnull_val;
+
+			/*
+			 * Use the isnull-tracking variant: it applies the STRICT
+			 * short-circuit (skip the call and yield NULL when an argument is
+			 * NULL) and reads the result's NULL flag back from fcinfo.  The
+			 * plain _fmgr() call passed isnull_out = NULL, which skipped both
+			 * and stored a strict function's result as non-NULL even when an
+			 * input (or the result) was NULL.
+			 */
+			datum_val = uplpgsql_compile_expr_fmgr_full(ctx, expr, estate_ref,
+														&isnull_val);
 			if (datum_val != NULL)
 			{
+				LLVMBuilderRef		builder = ctx->builder;
+				LLVMBasicBlockRef	null_bb, val_bb, done_bb;
+
 				elog(DEBUG1, "uplpgsql: fmgr bypass assignment to dno %d: %s",
 					 stmt->varno, stmt->expr->query);
+
+				null_bb = expr_append_block(ctx, "fmgr.assign.null");
+				val_bb = expr_append_block(ctx, "fmgr.assign.val");
+				done_bb = expr_append_block(ctx, "fmgr.assign.done");
+				LLVMBuildCondBr(builder, isnull_val, null_bb, val_bb);
+
+				/* NULL result → assign SQL NULL via the runtime helper */
+				LLVMPositionBuilderAtEnd(builder, null_bb);
+				{
+					LLVMValueRef args[] = {
+						estate_ref,
+						LLVMConstInt(ctx->types[UPLPGSQL_INT32],
+									 stmt->varno, false)
+					};
+
+					LLVMBuildCall2(builder, ctx->rt_fntypes[RT_ASSIGN_NULL],
+								   ctx->rt_funcs[RT_ASSIGN_NULL], args, 2, "");
+				}
+				LLVMBuildBr(builder, done_bb);
+
+				/* non-NULL result → store the value */
+				LLVMPositionBuilderAtEnd(builder, val_bb);
 				uplpgsql_emit_store_var_datum(ctx, estate_ref, stmt->varno,
 											  datum_val);
+				LLVMBuildBr(builder, done_bb);
+
+				LLVMPositionBuilderAtEnd(builder, done_bb);
 				return true;
 			}
 			/* Fall through to Tier 3 */
