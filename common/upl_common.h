@@ -422,6 +422,20 @@ extern Datum uplpgsql_rt_get_recfield_fast(UPLpgSQL_exec_state *estate,
 										   int rec_dno, int fnumber,
 										   bool *isnull_out);
 
+/*
+ * Native array <-> PG Datum marshalling, emitted at escape points.
+ *
+ * A native array's live contents are in flat memory (data_ptr/len_ptr); the
+ * variable's PG Datum is stale between escapes.  Emit sync before handing the
+ * variable to anything that reads it as a Datum, and refresh after anything
+ * that writes it as a Datum.  Defined in upl_compile_stmts.c; also called
+ * from upl_compile_expr.c.
+ */
+extern void uplpgsql_emit_sync_native_array(UPLpgSQL_compile_ctx *ctx,
+											struct UPLpgSQL_native_array *na);
+extern void uplpgsql_emit_refresh_native_array(UPLpgSQL_compile_ctx *ctx,
+											   struct UPLpgSQL_native_array *na);
+
 /* Runtime helpers for array element access from inlined expressions */
 extern Datum uplpgsql_rt_array_get_element(UPLpgSQL_exec_state *estate,
 										   int array_dno, int subscript,

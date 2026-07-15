@@ -500,3 +500,57 @@ end;
 $$ LANGUAGE uplpgsql immutable;
 
 select case_comment(1);
+
+--
+-- FOR ... IN <cursor> (cursor FOR loop).
+--
+-- The loop opens the cursor through uplpgsql_rt_open_forc_cursor(), which
+-- wraps the Portal in the cursor context that the fetch and close helpers
+-- expect.  Calling exec_open_forc_cursor() directly yields a bare Portal
+-- and the fetch reads it as a context.
+--
+create or replace function forc_basic() returns int language uplpgsql as $$
+declare t int := 0; rec record;
+  c cursor for select g as v from generate_series(1,3) g;
+begin
+  for rec in c loop t := t + rec.v; end loop;
+  return t;
+end; $$;
+select forc_basic();
+
+-- parameterised cursor
+create or replace function forc_args() returns int language uplpgsql as $$
+declare t int := 0; rec record;
+  c cursor(n int) for select g as v from generate_series(1,n) g;
+begin
+  for rec in c(4) loop t := t + rec.v; end loop;
+  return t;
+end; $$;
+select forc_args();
+
+-- RETURN out of the loop body: closes the cursor on the return path,
+-- which is a separate close site from normal loop exit
+create or replace function forc_return() returns int language uplpgsql as $$
+declare rec record;
+  c cursor for select g as v from generate_series(5,9) g;
+begin
+  for rec in c loop return rec.v; end loop;
+  return -1;
+end; $$;
+select forc_return();
+
+-- empty result, and FOUND afterwards
+create or replace function forc_empty() returns int language uplpgsql as $$
+declare t int := 0; rec record;
+  c cursor for select g as v from generate_series(1,0) g;
+begin
+  for rec in c loop t := t + rec.v; end loop;
+  if found then return -1; end if;
+  return t;
+end; $$;
+select forc_empty();
+
+drop function forc_basic();
+drop function forc_args();
+drop function forc_return();
+drop function forc_empty();

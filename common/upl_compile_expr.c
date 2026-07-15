@@ -288,6 +288,23 @@ uplpgsql_emit_load_param_datum(UPLpgSQL_compile_ctx *ctx,
 							   LLVMValueRef estate_ref, int dno)
 {
 	UPLpgSQL_datum *d = ctx_func(ctx)->datums[dno];
+	UPLpgSQL_native_array *na;
+
+	/*
+	 * Whole-datum read of a native array (y := x, f(x), ...).  The live
+	 * contents are in flat memory and the variable's Datum is stale, so
+	 * marshal it back before the load.  This is the only path by which a
+	 * native array is read as a whole Datum — subscript reads never reach
+	 * here, they GEP into data_ptr via the T_SubscriptingRef case — so the
+	 * cost falls only on genuine escapes.
+	 */
+	na = find_native_array(ctx, dno);
+	if (na != NULL)
+	{
+		elog(DEBUG1, "uplpgsql: native array to_datum dno %d (whole-datum read)",
+			 dno);
+		uplpgsql_emit_sync_native_array(ctx, na);
+	}
 
 	/*
 	 * Promise datums (TG_OP, TG_WHEN, etc.) need runtime resolution via
@@ -448,10 +465,22 @@ uplpgsql_emit_load_param_isnull(UPLpgSQL_compile_ctx *ctx,
 	UPLpgSQL_datum *d = ctx_func(ctx)->datums[dno];
 	LLVMBuilderRef builder = ctx->builder;
 	LLVMTypeRef i1 = ctx->types[UPLPGSQL_INT1];
+	UPLpgSQL_native_array *na;
 
 	if (d->dtype == UPLPGSQL_DTYPE_RECFIELD ||
 		d->dtype == UPLPGSQL_DTYPE_PROMISE)
 		return LLVMConstInt(i1, 0, false);
+
+	/*
+	 * A native array's variable carries a stale isnull — it is still the
+	 * declared-NULL initial value if the array was only ever populated in
+	 * flat memory.  Callers load isnull and the datum separately (and
+	 * isnull first), so sync here as well as in the datum load; otherwise
+	 * a live array reads back as NULL.
+	 */
+	na = find_native_array(ctx, dno);
+	if (na != NULL)
+		uplpgsql_emit_sync_native_array(ctx, na);
 
 	/* For plain vars: load datum->isnull */
 	{
@@ -2332,6 +2361,16 @@ uplpgsql_compile_expr_fmgr_full(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 					arg_isnull = fmgr_load_arg_isnull(ctx, arg_expr,
 													  estate_ref);
 
+					/*
+					 * fmgr_load_arg_datum recurses into
+					 * uplpgsql_compile_expr_fmgr for sub-expressions, which
+					 * returns NULL for anything it cannot compile.  Storing
+					 * that NULL would dereference it inside LLVM; bail out
+					 * instead and let the caller fall back to Tier 3.
+					 */
+					if (arg_datum == NULL || arg_isnull == NULL)
+						return NULL;
+
 					/* args[argidx].value */
 					arg_off = OFF_FCI_ARGS + SIZE_NULLABLE_DATUM * argidx
 							  + OFF_ND_VALUE;
@@ -2657,6 +2696,23 @@ uplpgsql_try_compile_assign(UPLpgSQL_compile_ctx *ctx,
 								   ctx->rt_fntypes[RT_COPY_ASSIGN_VAR_DATUM],
 								   ctx->rt_funcs[RT_COPY_ASSIGN_VAR_DATUM],
 								   args, 4, "");
+				}
+
+				/*
+				 * We just wrote a whole PG Datum into the target.  If the
+				 * target is a native array its flat memory is now stale,
+				 * so reload it from the Datum we stored.
+				 */
+				{
+					UPLpgSQL_native_array *target_na;
+
+					target_na = find_native_array(ctx, stmt->varno);
+					if (target_na != NULL)
+					{
+						elog(DEBUG1, "uplpgsql: native array from_datum dno %d "
+							 "(fmgr bypass assign)", target_na->dno);
+						uplpgsql_emit_refresh_native_array(ctx, target_na);
+					}
 				}
 				return true;
 			}
@@ -3383,6 +3439,20 @@ uplpgsql_try_compile_bool(UPLpgSQL_compile_ctx *ctx,
 	{
 		SPI_freeplan(expr_node->plan);
 		expr_node->plan = NULL;
+	}
+
+	/*
+	 * Returning false makes the caller emit RT_EVAL_BOOL, which evaluates
+	 * this condition in the interpreter and reads variables as PG Datums.
+	 * Sync native arrays first, or a condition over one (IF array_length(x,1)
+	 * = 3) sees the stale Datum instead of the live flat memory.
+	 */
+	{
+		int		na_i;
+
+		for (na_i = 0; na_i < ctx_num_native_arrays(ctx); na_i++)
+			uplpgsql_emit_sync_native_array(ctx,
+											&ctx_native_arrays(ctx)[na_i]);
 	}
 
 	return false;

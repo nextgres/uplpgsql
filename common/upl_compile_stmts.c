@@ -141,6 +141,13 @@ static void uplpgsql_compile_rollback(UPLpgSQL_compile_ctx *ctx,
 static void uplpgsql_analyze_native_arrays(UPLpgSQL_compile_ctx *ctx,
 										   UPLpgSQL_function *func);
 
+/* Native array sync (defined later, needed by uplpgsql_call_exec) */
+static void uplpgsql_sync_native_arrays(UPLpgSQL_compile_ctx *ctx);
+
+/* Native array lookup (defined later, needed by uplpgsql_emit_init_vars) */
+static UPLpgSQL_native_array *uplpgsql_find_native_array(UPLpgSQL_compile_ctx *ctx,
+														 int dno);
+
 /* Core compilation callbacks */
 static void uplpgsql_cb_compile_stmts(UPL_compile_ctx *ctx, void *stmts);
 static bool uplpgsql_cb_try_compile_bool(UPL_compile_ctx *ctx, void *expr,
@@ -205,6 +212,16 @@ uplpgsql_call_fn(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_rt_func which,
  *
  * For i32-returning functions (exec_stmt_*): returns i32.
  * For void-returning functions: returns NULL LLVMValueRef.
+ *
+ * Native arrays are synced to their PG Datums first.  Every exec_* callee
+ * reads variables as Datums, and a native array's Datum is stale between
+ * escapes, so anything reaching the interpreter must see marshalled data —
+ * RAISE, FOREACH, EXECUTE, PERFORM, cursors, and the rest.  Syncing at this
+ * one point covers them all; the alternative is remembering to do it in each
+ * of the two dozen callers, which is how RAISE/FOREACH/EXECUTE were missed.
+ * Callees that read no variables pay a wasted marshal, which is acceptable:
+ * they are interpreter round-trips already, and the sync is a no-op unless
+ * the function actually has native arrays.
  */
 static inline LLVMValueRef
 uplpgsql_call_exec(UPLpgSQL_compile_ctx *ctx, void *fn_addr,
@@ -216,6 +233,8 @@ uplpgsql_call_exec(UPLpgSQL_compile_ctx *ctx, void *fn_addr,
 	LLVMValueRef	fn_ptr;
 	unsigned		i;
 	const char	   *call_name;
+
+	uplpgsql_sync_native_arrays(ctx);
 
 	for (i = 0; i < count && i < 4; i++)
 		param_types[i] = LLVMTypeOf(args[i]);
@@ -351,6 +370,49 @@ uplpgsql_compile_body(UPL_compile_ctx *ctx)
 	uplpgsql_compile_block(ctx, func->action);
 }
 
+/*
+ * Emit RT_INIT_VAR for each of a block's declared variables.
+ *
+ * uplpgsql_rt_init_var() evaluates the DECLARE default with
+ * exec_assign_expr(), writing the variable's PG Datum.  For a native array
+ * that leaves flat memory untouched — data_ptr NULL, len_ptr 0 — so a later
+ * native subscript would fail its bounds check against a length of zero
+ * ("array subscript 1 out of range [1..0]") even though the variable holds a
+ * perfectly good array.  Reload flat memory from the Datum init_var just
+ * wrote.  Arrays with no default refresh from a NULL Datum, which yields the
+ * same empty state the entry block already established.
+ *
+ * The driver emits this rather than the core (which would otherwise do it in
+ * upl_emit_block) because refreshing native arrays is language-specific.
+ */
+static void
+uplpgsql_emit_init_vars(UPLpgSQL_compile_ctx *ctx, int n_initvars,
+						int *initvarnos)
+{
+	LLVMValueRef estate_ref = LLVMGetParam(ctx->function, 0);
+	int		i;
+
+	for (i = 0; i < n_initvars; i++)
+	{
+		int			dno = initvarnos[i];
+		UPLpgSQL_native_array *na;
+		LLVMValueRef args[] = {
+			estate_ref,
+			upl_const_int32(ctx, dno)
+		};
+
+		uplpgsql_call_fn(ctx, RT_INIT_VAR, args, 2);
+
+		na = uplpgsql_find_native_array(ctx, dno);
+		if (na != NULL)
+		{
+			elog(DEBUG1, "uplpgsql: native array from_datum dno %d (init var)",
+				 dno);
+			uplpgsql_emit_refresh_native_array(ctx, na);
+		}
+	}
+}
+
 /* ----------------------------------------------------------------
  * Exception handling callback
  *
@@ -426,15 +488,7 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 	}
 
 	/* Initialize declared variables */
-	for (i = 0; i < stmt->n_initvars; i++)
-	{
-		int dno = stmt->initvarnos[i];
-		LLVMValueRef args[] = {
-			estate_ref,
-			upl_const_int32(ctx, dno)
-		};
-		uplpgsql_call_fn(ctx, RT_INIT_VAR, args, 2);
-	}
+	uplpgsql_emit_init_vars(ctx, stmt->n_initvars, stmt->initvarnos);
 
 	/*
 	 * Compile body statements.  Redirect RETURN to our exception_return_bb
@@ -574,78 +628,6 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 #define NATIVE_ARRAY_TOTAL_STACK_MAX	16384
 
 /*
- * Check if an expression references a given dno as a plain Param
- * (not inside a SubscriptingRef).  This indicates the array value
- * is being used as a whole Datum, which disqualifies it.
- */
-static bool
-expr_uses_array_as_datum(UPLpgSQL_function *func, UPLpgSQL_expr *expr, int dno)
-{
-	CachedPlanSource *plansource;
-	CachedPlan *cplan;
-	Query	   *query;
-	ListCell   *lc;
-
-	if (expr == NULL || expr->plan == NULL)
-		return true;	/* can't analyze → assume escape */
-
-	plansource = (CachedPlanSource *) linitial(SPI_plan_get_plan_sources(expr->plan));
-	cplan = GetCachedPlan(plansource, NULL, NULL, NULL);
-	if (cplan == NULL)
-		return true;
-
-	query = linitial_node(Query, cplan->stmt_list);
-
-	/*
-	 * Check the target list for Param references to our dno that
-	 * are NOT inside a SubscriptingRef.  A SubscriptingRef accessing
-	 * our array is fine (that's a subscript read), but a naked Param
-	 * means the whole array is being used as a value.
-	 */
-	foreach(lc, query->targetList)
-	{
-		TargetEntry *tle = lfirst_node(TargetEntry, lc);
-		Expr		*texpr = tle->expr;
-
-		/* Naked Param reference to our array → escapes */
-		if (IsA(texpr, Param))
-		{
-			Param *p = (Param *) texpr;
-
-			if (p->paramkind == PARAM_EXTERN && p->paramid - 1 == dno)
-			{
-				ReleaseCachedPlan(cplan, NULL);
-				return true;
-			}
-		}
-
-		/*
-		 * RelabelType wrapping a Param is also a direct reference.
-		 */
-		if (IsA(texpr, RelabelType))
-		{
-			RelabelType *r = (RelabelType *) texpr;
-
-			if (IsA(r->arg, Param))
-			{
-				Param *p = (Param *) r->arg;
-
-				if (p->paramkind == PARAM_EXTERN && p->paramid - 1 == dno)
-				{
-					ReleaseCachedPlan(cplan, NULL);
-					return true;
-				}
-			}
-		}
-
-		/* SubscriptingRef on our array is fine — that's a subscript op */
-	}
-
-	ReleaseCachedPlan(cplan, NULL);
-	return false;
-}
-
-/*
  * Check if an expression contains a Param reference to a given dno
  * anywhere (used for RETURN, RAISE args, etc. where any reference escapes).
  */
@@ -679,20 +661,22 @@ native_array_check_stmt(UPLpgSQL_function *func, UPLpgSQL_stmt *stmt,
 		case UPLPGSQL_STMT_ASSIGN:
 			{
 				/*
-				 * Assignment TO a candidate array: only array_fill init
-				 * and subscript writes are allowed.  The actual expression
-				 * type checking happens during IR generation — if it's not
-				 * array_fill or subscript, compilation falls back.
+				 * ASSIGN never disqualifies a candidate; escapes are
+				 * handled at IR generation instead of here.
 				 *
-				 * We do NOT disqualify arrays referenced in other
-				 * assignments' expressions here, because expr_references_dno
-				 * uses the paramnos bitmapset which can't distinguish
-				 * subscript reads (x[i], safe) from whole-datum reads (x,
-				 * escape).  Subscript reads within expressions are compiled
-				 * to native GEP+load by the expression compiler.
+				 * We cannot decide it here: expr_references_dno uses the
+				 * paramnos bitmapset, which can't distinguish a subscript
+				 * read (x[i], safe and compiled to native GEP+load) from a
+				 * whole-datum read (x, an escape).  Disqualifying on
+				 * paramnos would drop every array that is ever read by
+				 * subscript — that is, all of them.
 				 *
-				 * True whole-datum escapes (y := x, RETURN x, etc.) are
-				 * caught by the other statement-type cases below.
+				 * So uplpgsql_compile_assign() handles both escape
+				 * directions when it falls back to the interpreter: it
+				 * syncs flat memory into the PG Datums beforehand (so a
+				 * whole-datum read like y := x sees live data), and
+				 * reloads flat memory afterwards if the target is itself
+				 * a native array (so x := ARRAY[...] is not left stale).
 				 */
 			}
 			break;
@@ -2147,8 +2131,19 @@ uplpgsql_compile_stmt(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt *stmt)
 static void
 uplpgsql_compile_block(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_block *stmt)
 {
+	/*
+	 * Initialize the block's variables here instead of letting the core do
+	 * it, so native arrays get refreshed from the Datum their DECLARE
+	 * default writes; then pass n_initvars = 0 so the core does not repeat
+	 * the loop.  Blocks with exception handlers are delegated whole to
+	 * uplpgsql_compile_block_exceptions(), which does its own init inside
+	 * the TRY — the core ignores n_initvars on that path.
+	 */
+	if (stmt->exceptions == NULL)
+		uplpgsql_emit_init_vars(ctx, stmt->n_initvars, stmt->initvarnos);
+
 	upl_emit_block(ctx,
-				   stmt->n_initvars, stmt->initvarnos,
+				   0, NULL,
 				   stmt->body,
 				   stmt->exceptions != NULL,
 				   stmt,
@@ -2171,36 +2166,100 @@ uplpgsql_compile_block(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_block *stmt)
  * from the flat native memory so the interpreter sees valid data.
  * This avoids the cost of syncing on every subscript write.
  */
+void
+uplpgsql_emit_sync_native_array(UPLpgSQL_compile_ctx *ctx,
+								UPLpgSQL_native_array *na)
+{
+	LLVMValueRef estate_ref = LLVMGetParam(ctx->function, 0);
+	LLVMTypeRef i32_ty = ctx->types[UPLPGSQL_INT32];
+	LLVMValueRef data, len;
+	LLVMValueRef args[6];
+
+	data = LLVMBuildLoad2(ctx->builder, ctx->types[UPLPGSQL_PTR],
+						  na->data_ptr, "sync.data");
+	len = LLVMBuildLoad2(ctx->builder, i32_ty,
+						 na->len_ptr, "sync.len");
+
+	args[0] = estate_ref;
+	args[1] = LLVMConstInt(i32_ty, na->dno, false);
+	args[2] = data;
+	args[3] = len;
+	args[4] = LLVMConstInt(i32_ty, na->elemtype, false);
+	args[5] = LLVMConstInt(i32_ty, na->elem_size, false);
+
+	LLVMBuildCall2(ctx->builder,
+		ctx->rt_fntypes[RT_NATIVE_ARRAY_TO_DATUM],
+		ctx->rt_funcs[RT_NATIVE_ARRAY_TO_DATUM],
+		args, 6, "");
+}
+
 static void
 uplpgsql_sync_native_arrays(UPLpgSQL_compile_ctx *ctx)
 {
 	int		na_i;
-	LLVMValueRef estate_ref = LLVMGetParam(ctx->function, 0);
-	LLVMTypeRef i32_ty = ctx->types[UPLPGSQL_INT32];
+
+	for (na_i = 0; na_i < ctx_num_native_arrays(ctx); na_i++)
+		uplpgsql_emit_sync_native_array(ctx, &ctx_native_arrays(ctx)[na_i]);
+}
+
+/*
+ * Look up native array metadata by dno, or NULL if dno is not one.
+ */
+static UPLpgSQL_native_array *
+uplpgsql_find_native_array(UPLpgSQL_compile_ctx *ctx, int dno)
+{
+	int		na_i;
 
 	for (na_i = 0; na_i < ctx_num_native_arrays(ctx); na_i++)
 	{
-		UPLpgSQL_native_array *na = &ctx_native_arrays(ctx)[na_i];
-		LLVMValueRef data, len;
-		LLVMValueRef args[6];
-
-		data = LLVMBuildLoad2(ctx->builder, ctx->types[UPLPGSQL_PTR],
-							  na->data_ptr, "sync.data");
-		len = LLVMBuildLoad2(ctx->builder, i32_ty,
-							 na->len_ptr, "sync.len");
-
-		args[0] = estate_ref;
-		args[1] = LLVMConstInt(i32_ty, na->dno, false);
-		args[2] = data;
-		args[3] = len;
-		args[4] = LLVMConstInt(i32_ty, na->elemtype, false);
-		args[5] = LLVMConstInt(i32_ty, na->elem_size, false);
-
-		LLVMBuildCall2(ctx->builder,
-			ctx->rt_fntypes[RT_NATIVE_ARRAY_TO_DATUM],
-			ctx->rt_funcs[RT_NATIVE_ARRAY_TO_DATUM],
-			args, 6, "");
+		if (ctx_native_arrays(ctx)[na_i].dno == dno)
+			return &ctx_native_arrays(ctx)[na_i];
 	}
+
+	return NULL;
+}
+
+/*
+ * Reload one native array's flat memory from its PG Datum variable.
+ *
+ * The inverse of uplpgsql_sync_native_arrays().  Called after the
+ * interpreter has written a whole array Datum into the variable (SELECT
+ * INTO, or an ASSIGN that fell back to exec_assign_expr), which leaves
+ * data_ptr/len_ptr pointing at stale memory.  Without this, a later
+ * native subscript read would return the pre-assignment contents.
+ */
+void
+uplpgsql_emit_refresh_native_array(UPLpgSQL_compile_ctx *ctx,
+								   UPLpgSQL_native_array *na)
+{
+	LLVMValueRef estate_ref = LLVMGetParam(ctx->function, 0);
+	LLVMTypeRef	 i32_ty = ctx->types[UPLPGSQL_INT32];
+	LLVMValueRef datum_val, isnull_val, new_data, new_len, nelems_ptr;
+
+	datum_val = upl_emit_load_var_datum(ctx, estate_ref, na->dno);
+	isnull_val = upl_emit_load_var_isnull(ctx, estate_ref, na->dno);
+
+	nelems_ptr = LLVMBuildAlloca(ctx->builder, i32_ty, "na_nelems");
+	isnull_val = LLVMBuildZExt(ctx->builder, isnull_val, i32_ty, "isnull_i32");
+
+	{
+		LLVMValueRef call_args[] = {
+			estate_ref,
+			datum_val,
+			isnull_val,
+			LLVMConstInt(i32_ty, na->elem_size, false),
+			nelems_ptr
+		};
+
+		new_data = LLVMBuildCall2(ctx->builder,
+			ctx->rt_fntypes[RT_NATIVE_ARRAY_FROM_DATUM],
+			ctx->rt_funcs[RT_NATIVE_ARRAY_FROM_DATUM],
+			call_args, 5, "na.from_datum");
+	}
+
+	LLVMBuildStore(ctx->builder, new_data, na->data_ptr);
+	new_len = LLVMBuildLoad2(ctx->builder, i32_ty, nelems_ptr, "na.new_len");
+	LLVMBuildStore(ctx->builder, new_len, na->len_ptr);
 }
 
 static void
@@ -2219,9 +2278,16 @@ uplpgsql_compile_return(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_return *stmt)
 static void
 uplpgsql_compile_assign(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_assign *stmt)
 {
+	UPLpgSQL_native_array *target_na;
+
 	/* Try to inline as native int4 arithmetic */
 	if (uplpgsql_try_compile_assign(ctx, stmt))
 		return;
+
+	/*
+	 * Read escape (y := x) is handled by uplpgsql_call_exec below, which
+	 * syncs native arrays before entering the interpreter.
+	 */
 
 	/* Fall back to direct exec_assign_expr(plstate, datums[dno], expr) */
 	{
@@ -2250,6 +2316,20 @@ uplpgsql_compile_assign(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_assign *stmt)
 
 		uplpgsql_call_exec(ctx, (void *) exec_assign_expr,
 						   ctx->types[UPLPGSQL_VOID], args, 3);
+	}
+
+	/*
+	 * Write escape: if the target is itself a native array, the interpreter
+	 * just stored a whole PG array Datum into it (x := ARRAY[...]), leaving
+	 * data_ptr/len_ptr stale.  Reload flat memory from the new Datum so
+	 * later native subscript reads see it.
+	 */
+	target_na = uplpgsql_find_native_array(ctx, stmt->varno);
+	if (target_na != NULL)
+	{
+		elog(DEBUG1, "uplpgsql: native array from_datum dno %d (ASSIGN)",
+			 target_na->dno);
+		uplpgsql_emit_refresh_native_array(ctx, target_na);
 	}
 }
 
@@ -2424,54 +2504,14 @@ uplpgsql_compile_execsql(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_execsql *stmt)
 
 		for (ti = 0; ti < num_targets; ti++)
 		{
-			UPLpgSQL_native_array *na = NULL;
-			int		na_i;
+			UPLpgSQL_native_array *na;
 
-			for (na_i = 0; na_i < ctx_num_native_arrays(ctx); na_i++)
-			{
-				if (ctx_native_arrays(ctx)[na_i].dno == target_dnos[ti])
-				{
-					na = &ctx_native_arrays(ctx)[na_i];
-					break;
-				}
-			}
-
+			na = uplpgsql_find_native_array(ctx, target_dnos[ti]);
 			if (na != NULL)
 			{
-				LLVMValueRef estate_ref = LLVMGetParam(ctx->function, 0);
-				LLVMValueRef datum_val, isnull_val, new_data, new_len;
-				LLVMValueRef nelems_ptr;
-				LLVMTypeRef	 i32_ty = ctx->types[UPLPGSQL_INT32];
-
 				elog(DEBUG1, "uplpgsql: native array from_datum dno %d "
 					 "(SELECT INTO)", na->dno);
-
-				datum_val = upl_emit_load_var_datum(ctx, estate_ref, na->dno);
-				isnull_val = upl_emit_load_var_isnull(ctx, estate_ref, na->dno);
-
-				nelems_ptr = LLVMBuildAlloca(ctx->builder, i32_ty, "na_nelems");
-				isnull_val = LLVMBuildZExt(ctx->builder, isnull_val,
-										   i32_ty, "isnull_i32");
-
-				{
-					LLVMValueRef call_args[] = {
-						estate_ref,
-						datum_val,
-						isnull_val,
-						LLVMConstInt(i32_ty, na->elem_size, false),
-						nelems_ptr
-					};
-
-					new_data = LLVMBuildCall2(ctx->builder,
-						ctx->rt_fntypes[RT_NATIVE_ARRAY_FROM_DATUM],
-						ctx->rt_funcs[RT_NATIVE_ARRAY_FROM_DATUM],
-						call_args, 5, "na.from_datum");
-				}
-
-				LLVMBuildStore(ctx->builder, new_data, na->data_ptr);
-				new_len = LLVMBuildLoad2(ctx->builder, i32_ty, nelems_ptr,
-										 "na.new_len");
-				LLVMBuildStore(ctx->builder, new_len, na->len_ptr);
+				uplpgsql_emit_refresh_native_array(ctx, na);
 			}
 		}
 	}
@@ -2679,6 +2719,15 @@ uplpgsql_compile_fors(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_fors *stmt)
 	LLVMBasicBlockRef	cond_bb, body_bb, exit_bb, fors_return_bb, cont_bb;
 	LLVMBasicBlockRef	saved_return_bb;
 	int					target_dno = stmt->var->dno;
+
+	/*
+	 * Opening the cursor evaluates the loop query in the interpreter, which
+	 * reads variables as PG Datums.  This goes through uplpgsql_call_fn
+	 * rather than uplpgsql_call_exec, so it does not get that function's
+	 * sync — do it here, or a query over a native array (FOR r IN SELECT
+	 * unnest(x)) sees a stale NULL and returns no rows.
+	 */
+	uplpgsql_sync_native_arrays(ctx);
 
 	/* Open the query cursor */
 	{
@@ -2907,14 +2956,26 @@ uplpgsql_compile_forc(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_forc *stmt)
 	LLVMBasicBlockRef	saved_return_bb;
 	int					target_dno = stmt->var->dno;
 
-	/* Open the cursor via direct exec call */
+	/*
+	 * Open the cursor.
+	 *
+	 * This must go through uplpgsql_rt_open_forc_cursor(), not straight to
+	 * exec_open_forc_cursor(): the latter returns a bare Portal, but the
+	 * fetch below reads the result as a UPLpgSQL_cursor_ctx (portal plus
+	 * prefetch batch state).  The rt wrapper allocates that context and is
+	 * what uplpgsql_rt_close_forc_cursor() expects to free.
+	 *
+	 * Opening evaluates the cursor's query and any arguments in the
+	 * interpreter, and uplpgsql_call_fn does not sync native arrays the way
+	 * uplpgsql_call_exec does, so sync explicitly first.
+	 */
+	uplpgsql_sync_native_arrays(ctx);
 	{
 		LLVMValueRef args[] = {
-			ctx_plstate(ctx),
+			LLVMGetParam(ctx->function, 0),
 			stmt_ptr
 		};
-		portal_val = uplpgsql_call_exec(ctx, (void *) exec_open_forc_cursor,
-										ctx->types[UPLPGSQL_PTR], args, 2);
+		portal_val = uplpgsql_call_fn(ctx, RT_OPEN_FORC_CURSOR, args, 2);
 	}
 
 	/* Allocate found flag */
@@ -2973,12 +3034,11 @@ uplpgsql_compile_forc(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_forc *stmt)
 	LLVMPositionBuilderAtEnd(ctx->builder, forc_return_bb);
 	{
 		LLVMValueRef args[] = {
-			ctx_plstate(ctx),
+			LLVMGetParam(ctx->function, 0),
 			stmt_ptr,
 			portal_val
 		};
-		uplpgsql_call_exec(ctx, (void *) exec_close_forc_cursor,
-						   ctx->types[UPLPGSQL_VOID], args, 3);
+		uplpgsql_call_fn(ctx, RT_CLOSE_FORC_CURSOR, args, 3);
 	}
 	LLVMBuildBr(ctx->builder, saved_return_bb);
 
@@ -2986,12 +3046,11 @@ uplpgsql_compile_forc(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_forc *stmt)
 	LLVMPositionBuilderAtEnd(ctx->builder, exit_bb);
 	{
 		LLVMValueRef args[] = {
-			ctx_plstate(ctx),
+			LLVMGetParam(ctx->function, 0),
 			stmt_ptr,
 			portal_val
 		};
-		uplpgsql_call_exec(ctx, (void *) exec_close_forc_cursor,
-						   ctx->types[UPLPGSQL_VOID], args, 3);
+		uplpgsql_call_fn(ctx, RT_CLOSE_FORC_CURSOR, args, 3);
 	}
 
 	/* Set FOUND */
@@ -3043,6 +3102,13 @@ uplpgsql_compile_dynfors(UPLpgSQL_compile_ctx *ctx,
 	LLVMBasicBlockRef	cond_bb, body_bb, exit_bb, dynfors_return_bb, cont_bb;
 	LLVMBasicBlockRef	saved_return_bb;
 	int					target_dno = stmt->var->dno;
+
+	/*
+	 * As in uplpgsql_compile_fors(): the open evaluates the query text and
+	 * its USING arguments in the interpreter, and reaches it via
+	 * uplpgsql_call_fn, which does not sync.
+	 */
+	uplpgsql_sync_native_arrays(ctx);
 
 	/* Open the dynamic cursor */
 	{

@@ -93,11 +93,14 @@ upl_llvm_init(void)
 	LLVMInitializeNativeAsmPrinter();
 	LLVMInitializeNativeAsmParser();
 
-	upl_llvm_initialized = true;
-
 	/*
-	 * Create target machine (used for optimization passes)
+	 * Create target machine (used for optimization passes).
+	 *
+	 * Guarded so that a retry — reached when a step below elog(ERROR)s and
+	 * longjmps out before upl_llvm_initialized is set — reuses the machine
+	 * built by the failed attempt instead of leaking it and building another.
 	 */
+	if (upl_target_machine == NULL)
 	{
 		char		   *triple;
 		char		   *error;
@@ -129,6 +132,19 @@ upl_llvm_init(void)
 
 			LLVMDisposeMessage(host_cpu);
 			LLVMDisposeMessage(host_features);
+		}
+
+		/*
+		 * LLVMCreateTargetMachine reports failure by returning NULL; it has
+		 * no error-message out-param, so name the triple we failed on.
+		 */
+		if (upl_target_machine == NULL)
+		{
+			char *msg = pstrdup(triple);
+
+			LLVMDisposeMessage(triple);
+			elog(ERROR, "upl: failed to create LLVM target machine for %s",
+				 msg);
 		}
 
 		LLVMDisposeMessage(triple);
@@ -174,6 +190,14 @@ upl_llvm_init(void)
 			LLVMOrcJITDylibAddGenerator(dylib, gen);
 		}
 	}
+
+	/*
+	 * Set last, once the target machine and JIT instance both exist.  The
+	 * steps above elog(ERROR) on failure, which longjmps out; setting the
+	 * flag any earlier would make a retry short-circuit above and leave
+	 * upl_jit_instance NULL for the life of the backend.
+	 */
+	upl_llvm_initialized = true;
 
 	elog(DEBUG1, "upl: LLVM %d.%d initialized, OrcJIT ready",
 		 LLVM_VERSION_MAJOR, LLVM_VERSION_MINOR);

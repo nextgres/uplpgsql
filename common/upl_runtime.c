@@ -1451,8 +1451,20 @@ uplpgsql_rt_native_array_from_datum(UPLpgSQL_exec_state *estate,
 
 	arr = DatumGetArrayTypeP(array_datum);
 
-	/* Safety: ensure we have a non-null, non-empty array */
-	if (ARR_NDIM(arr) == 0)
+	/*
+	 * The native form is a flat vector: one dimension, lower bound 1, which
+	 * is all uplpgsql_rt_native_array_to_datum() can rebuild (it uses
+	 * construct_array()).  Refuse anything else — multi-dimensional arrays,
+	 * or a non-standard lower bound such as '[2:3]={9,10}' — because taking
+	 * it native would silently flatten it on the way back out.
+	 *
+	 * Returning NULL leaves the caller's data_ptr NULL, which is the "not
+	 * native" state: to_datum() then skips the array entirely and the
+	 * variable keeps the real Datum the interpreter maintains.
+	 *
+	 * Also covers ARR_NDIM == 0 (an empty array).
+	 */
+	if (ARR_NDIM(arr) != 1 || ARR_LBOUND(arr)[0] != 1)
 	{
 		*out_nelems = 0;
 		return NULL;
