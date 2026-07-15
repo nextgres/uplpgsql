@@ -346,7 +346,7 @@ uplpgsql_call_handler(PG_FUNCTION_ARGS)
 	/*
 	 * Compile the function (get AST via our forked parser).
 	 */
-	func = uplpgsql_compile(fcinfo, isTrigger || isEventTrigger);
+	func = uplpgsql_compile(fcinfo, false);
 
 	/* Must save and restore prior value of cur_estate */
 	save_cur_estate = func->cur_estate;
@@ -664,7 +664,7 @@ uplpgsql_validator(PG_FUNCTION_ARGS)
 		}
 
 		/* Test-compile the function */
-		uplpgsql_compile(fake_fcinfo, is_trigger || is_event_trigger);
+		uplpgsql_compile(fake_fcinfo, true);
 
 		if ((rc = SPI_finish()) != SPI_OK_FINISH)
 			elog(ERROR, "SPI_finish failed: %s", SPI_result_code_string(rc));
