@@ -6,17 +6,22 @@
 PG_CONFIG ?= pg_config
 PG_INCLUDEDIR_SERVER := $(shell $(PG_CONFIG) --includedir-server)
 
-UPL_LLVM_CONFIG ?= /opt/homebrew/opt/llvm/bin/llvm-config
+# Prefer an llvm-config on PATH (Linux, and macOS with LLVM on PATH); fall
+# back to the Homebrew location.  Override with UPL_LLVM_CONFIG=... if needed.
+UPL_LLVM_CONFIG ?= $(shell command -v llvm-config 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-config)
 UPL_LLVM_CFLAGS := $(shell $(UPL_LLVM_CONFIG) --cflags)
 
 CORE_DIR = ../core
 
 CC ?= cc
+# -fPIC: these objects are archived into a static lib that is linked into the
+# driver's shared object; on ELF platforms that requires position-independent
+# code.  (No-op on macOS, where all code is already PIC.)
 CFLAGS = -Wall -Wmissing-prototypes -Wpointer-arith \
 	-Wdeclaration-after-statement -Werror=vla \
 	-Wendif-labels -Wmissing-format-attribute \
 	-Wformat-security -fno-strict-aliasing -fwrapv \
-	-fvisibility=hidden -O2 \
+	-fvisibility=hidden -fPIC -O2 \
 	-I$(PG_INCLUDEDIR_SERVER) \
 	-I$(CORE_DIR) \
 	$(UPL_LLVM_CFLAGS)
