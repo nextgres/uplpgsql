@@ -433,6 +433,7 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 	LLVMBasicBlockRef	catch_enter_bb;
 	LLVMBasicBlockRef	try_exit_bb;
 	LLVMBasicBlockRef	exception_return_bb;
+	LLVMBasicBlockRef	handler_return_bb;
 	LLVMBasicBlockRef	after_block_bb;
 	LLVMBasicBlockRef	rethrow_bb;
 	LLVMBasicBlockRef	saved_return_bb;
@@ -451,6 +452,7 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 	catch_enter_bb = upl_append_block(ctx, "exc.catch_enter");
 	try_exit_bb = upl_append_block(ctx, "exc.try_exit");
 	exception_return_bb = upl_append_block(ctx, "exc.return");
+	handler_return_bb = upl_append_block(ctx, "exc.handler_return");
 	after_block_bb = upl_append_block(ctx, "exc.after");
 	rethrow_bb = upl_append_block(ctx, "exc.rethrow");
 
@@ -535,6 +537,15 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 	switch_inst = LLVMBuildSwitch(ctx->builder, handler_idx,
 								   rethrow_bb, num_handlers);
 
+	/*
+	 * A RETURN inside a handler body must still run HANDLER_DONE (restore
+	 * cur_error, pop the stmt_mcontext, free the frame) before it leaves the
+	 * block.  Redirect RETURN to a landing pad that does so; the normal
+	 * fall-through path emits its own HANDLER_DONE below.
+	 */
+	saved_return_bb = ctx->return_bb;
+	ctx->return_bb = handler_return_bb;
+
 	/* === HANDLER BLOCKS === */
 	i = 0;
 	foreach(lc, exc_list)
@@ -565,7 +576,7 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 		/* Compile the handler's statements */
 		uplpgsql_compile_stmts(ctx, exception->action);
 
-		/* Clean up after handler */
+		/* Clean up after handler (normal, non-RETURN completion) */
 		{
 			LLVMValueRef args[] = { estate_ref, frame_ptr };
 			uplpgsql_call_fn(ctx, RT_EXCEPTION_HANDLER_DONE, args, 2);
@@ -575,6 +586,16 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 
 		i++;
 	}
+
+	ctx->return_bb = saved_return_bb;
+
+	/* === HANDLER RETURN (RETURN inside a handler body) === */
+	LLVMPositionBuilderAtEnd(ctx->builder, handler_return_bb);
+	{
+		LLVMValueRef args[] = { estate_ref, frame_ptr };
+		uplpgsql_call_fn(ctx, RT_EXCEPTION_HANDLER_DONE, args, 2);
+	}
+	LLVMBuildBr(ctx->builder, saved_return_bb);
 
 	/* === RETHROW === */
 	LLVMPositionBuilderAtEnd(ctx->builder, rethrow_bb);
