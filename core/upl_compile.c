@@ -39,6 +39,28 @@
 
 #include "miscadmin.h"
 
+/*
+ * Symbol name to emit for sigsetjmp.
+ *
+ * Compiled functions with an exception handler call sigsetjmp directly — it
+ * has to run in the compiled function's own frame, so it cannot be hidden
+ * behind a runtime helper — and the JIT resolves it as a process symbol.
+ *
+ * glibc does not export a "sigsetjmp" symbol at all: <setjmp.h> defines
+ * sigsetjmp as a macro over __sigsetjmp(env, savemask).  Emitting a call to
+ * "sigsetjmp" therefore fails to materialize on Linux/glibc, and every
+ * function containing an EXCEPTION handler dies with a symbol lookup failure.
+ * The two take identical arguments, so naming __sigsetjmp is the whole fix.
+ *
+ * macOS/BSD and musl do export a real sigsetjmp.  __GLIBC__ comes from
+ * features.h, which postgres.h pulls in well before this point.
+ */
+#ifdef __GLIBC__
+#define UPL_SIGSETJMP_SYM	"__sigsetjmp"
+#else
+#define UPL_SIGSETJMP_SYM	"sigsetjmp"
+#endif
+
 /* Generation counter for unique LLVM symbol names across recompilations */
 static uint64 compile_gen = 0;
 
@@ -863,7 +885,7 @@ upl_compile_function(UPL_compile_ctx *ctx, UPL_compile_hooks *hooks)
 			LLVMAttributeRef attr;
 
 			ctx->sigsetjmp_fntype = sjft;
-			sjfn = LLVMAddFunction(ctx->module, "sigsetjmp", sjft);
+			sjfn = LLVMAddFunction(ctx->module, UPL_SIGSETJMP_SYM, sjft);
 			ctx->sigsetjmp_fn = sjfn;
 
 			/* Mark as returns_twice -- critical for correct codegen */
