@@ -170,12 +170,13 @@ Only the PL/pgSQL driver lives in this tree today.
 
 ## Building
 
-Requires PostgreSQL 20devel built `--with-llvm`, and LLVM 14+. The build is C only and uses the LLVM C API only.
+Requires PostgreSQL 20devel and LLVM 15+, and is developed/tested against LLVM 22. The build is C only and uses the LLVM C API only.
+
+PostgreSQL does **not** need to be built `--with-llvm`. `uplpgsql` links its own LLVM and owns its LLJIT instance; it never touches PostgreSQL's `llvmjit` provider. A stock server with no JIT support of its own runs JIT-compiled PL/pgSQL just fine.
 
 ```sh
-source ../postgres.env      # sets PG_HOME, PATH, DYLD_LIBRARY_PATH, PGDATA
 make install
-make installcheck PGPORT=5433
+make installcheck
 ```
 
 PGXS does not track header dependencies. After editing anything in `core/` or `common/`, run `make clean && make install` — a stale object file with the old struct layout will not fail to link, it will fail at runtime.
