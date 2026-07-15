@@ -1101,6 +1101,9 @@ uplpgsql_rt_exception_try_exit(UPLpgSQL_exec_state *estate, void *frame_ptr)
 
 	/* Restore eval_econtext to the outer one */
 	plstate->eval_econtext = frame->old_eval_econtext;
+
+	/* Frame is done; free it (this is a terminal exit path for the block). */
+	pfree(frame);
 }
 
 /*
@@ -1229,6 +1232,9 @@ uplpgsql_rt_exception_handler_done(UPLpgSQL_exec_state *estate,
 	/* Restore stmt_mcontext stack and release the error data */
 	pop_stmt_mcontext(plstate);
 	MemoryContextReset(frame->stmt_mcontext);
+
+	/* Frame is done; free it (terminal exit path for a handled block). */
+	pfree(frame);
 }
 
 /*
@@ -1249,6 +1255,9 @@ uplpgsql_rt_exception_rethrow(UPLpgSQL_exec_state *estate, void *frame_ptr)
 
 	/* Restore stmt_mcontext and rethrow */
 	pop_stmt_mcontext(plstate);
+
+	/* Free the frame before we longjmp out (edata lives in stmt_mcontext). */
+	pfree(frame);
 
 	ReThrowError(edata);
 }
