@@ -1,0 +1,16 @@
+# Build artifacts
+*.o
+*.a
+*.dylib
+*.so
+*.bc
+
+# Test output
+test/*/results/
+test/*/regression.diffs
+test/*/regression.out
+
+# Editor files
+*.swp
+*~
+.DS_Store

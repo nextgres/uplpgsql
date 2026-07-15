@@ -1,0 +1,4 @@
+comment = 'LLVM JIT-compiled PL/pgSQL'
+default_version = '1.0'
+module_pathname = '$libdir/uplpgsql'
+trusted = true
