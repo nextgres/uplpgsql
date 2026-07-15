@@ -1,0 +1,808 @@
+--
+-- plpgsql_coverage
+--
+-- Surfaces the compiler supports but nothing else exercised: GET DIAGNOSTICS,
+-- DO blocks (the inline handler), RETURNS TABLE, integer overflow edge cases,
+-- the extra_warnings/extra_errors GUCs, and event triggers.
+--
+-- Every expected value here was taken from stock PL/pgSQL running the same
+-- body; uplpgsql must agree with the interpreter it replaces.
+--
+--
+-- GET DIAGNOSTICS
+--
+CREATE TABLE cov_gd(i int);
+CREATE FUNCTION cov_rowcount() RETURNS int LANGUAGE uplpgsql AS $$
+DECLARE n int;
+BEGIN
+  INSERT INTO cov_gd SELECT generate_series(1,3);
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END; $$;
+SELECT cov_rowcount();
+ cov_rowcount 
+--------------
+            3
+(1 row)
+
+CREATE FUNCTION cov_rowcount_upd() RETURNS int LANGUAGE uplpgsql AS $$
+DECLARE n int;
+BEGIN
+  UPDATE cov_gd SET i = i + 1;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END; $$;
+SELECT cov_rowcount_upd();
+ cov_rowcount_upd 
+------------------
+                3
+(1 row)
+
+-- ROW_COUNT after a no-op
+CREATE FUNCTION cov_rowcount_zero() RETURNS int LANGUAGE uplpgsql AS $$
+DECLARE n int;
+BEGIN
+  DELETE FROM cov_gd WHERE i = 9999;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END; $$;
+SELECT cov_rowcount_zero();
+ cov_rowcount_zero 
+-------------------
+                 0
+(1 row)
+
+CREATE FUNCTION cov_pg_context() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE s text;
+BEGIN
+  GET DIAGNOSTICS s = PG_CONTEXT;
+  RETURN CASE WHEN s IS NULL THEN 'null' ELSE 'has-context' END;
+END; $$;
+SELECT cov_pg_context();
+ cov_pg_context 
+----------------
+ has-context
+(1 row)
+
+-- GET STACKED DIAGNOSTICS inside a handler
+CREATE FUNCTION cov_stacked() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE msg text; state text;
+BEGIN
+  RAISE EXCEPTION 'boom-%', 42;
+EXCEPTION WHEN others THEN
+  GET STACKED DIAGNOSTICS msg = MESSAGE_TEXT, state = RETURNED_SQLSTATE;
+  RETURN msg || '/' || state;
+END; $$;
+SELECT cov_stacked();
+  cov_stacked  
+---------------
+ boom-42/P0001
+(1 row)
+
+-- SQLSTATE of a real (non-RAISE) error, read in the handler
+CREATE FUNCTION cov_stacked_div() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE state text; a int := 1; b int := 0; r int;
+BEGIN
+  r := a / b;
+  RETURN 'no-error';
+EXCEPTION WHEN others THEN
+  GET STACKED DIAGNOSTICS state = RETURNED_SQLSTATE;
+  RETURN state;
+END; $$;
+SELECT cov_stacked_div();
+ cov_stacked_div 
+-----------------
+ 22012
+(1 row)
+
+--
+-- DO blocks (uplpgsql_inline_handler)
+--
+DO LANGUAGE uplpgsql $$
+BEGIN
+  RAISE NOTICE 'do: %', 1 + 1;
+END $$;
+NOTICE:  do: 2
+-- the inline handler's error path
+DO LANGUAGE uplpgsql $$
+BEGIN
+  RAISE EXCEPTION 'do-error';
+EXCEPTION WHEN others THEN
+  RAISE NOTICE 'do caught: %', SQLERRM;
+END $$;
+NOTICE:  do caught: do-error
+-- a DO block that declares and loops
+DO LANGUAGE uplpgsql $$
+DECLARE t int := 0;
+BEGIN
+  FOR i IN 1..4 LOOP t := t + i; END LOOP;
+  RAISE NOTICE 'do sum: %', t;
+END $$;
+NOTICE:  do sum: 10
+-- an uncaught error out of a DO block
+DO LANGUAGE uplpgsql $$
+BEGIN
+  RAISE EXCEPTION 'do-uncaught';
+END $$;
+ERROR:  do-uncaught
+CONTEXT:  PL/pgSQL function inline_code_block line 3 at RAISE
+--
+-- RETURNS TABLE / SETOF
+--
+CREATE FUNCTION cov_table(n int) RETURNS TABLE(id int, lbl text) LANGUAGE uplpgsql AS $$
+BEGIN
+  FOR i IN 1..n LOOP
+    id := i;
+    lbl := 'r' || i;
+    RETURN NEXT;
+  END LOOP;
+END; $$;
+SELECT * FROM cov_table(3);
+ id | lbl 
+----+-----
+  1 | r1
+  2 | r2
+  3 | r3
+(3 rows)
+
+-- RETURNS TABLE fed by RETURN QUERY
+CREATE FUNCTION cov_table_query(n int) RETURNS TABLE(id int) LANGUAGE uplpgsql AS $$
+BEGIN
+  RETURN QUERY SELECT g FROM generate_series(1,n) g;
+END; $$;
+SELECT * FROM cov_table_query(3);
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
+-- SETOF composite
+CREATE TYPE cov_pair AS (a int, b text);
+CREATE FUNCTION cov_setof() RETURNS SETOF cov_pair LANGUAGE uplpgsql AS $$
+DECLARE r cov_pair;
+BEGIN
+  r.a := 1; r.b := 'x'; RETURN NEXT r;
+  r.a := 2; r.b := 'y'; RETURN NEXT r;
+END; $$;
+SELECT * FROM cov_setof();
+ a | b 
+---+---
+ 1 | x
+ 2 | y
+(2 rows)
+
+-- RETURN QUERY EXECUTE
+CREATE FUNCTION cov_return_query_exec() RETURNS SETOF int LANGUAGE uplpgsql AS $$
+BEGIN
+  RETURN QUERY EXECUTE 'select g from generate_series(1,3) g';
+END; $$;
+SELECT * FROM cov_return_query_exec();
+ cov_return_query_exec 
+-----------------------
+                     1
+                     2
+                     3
+(3 rows)
+
+--
+-- Integer overflow / INT_MIN edge cases.
+--
+-- These compile to overflow intrinsics; INT_MIN / -1 and INT_MIN % -1 are the
+-- cases where the hardware instruction traps, so they must be handled without
+-- crashing the backend.
+--
+CREATE FUNCTION cov_int4_min_div() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE a int := -2147483648; b int := -1; r int;
+BEGIN
+  r := a / b;
+  RETURN r::text;
+EXCEPTION WHEN others THEN RETURN SQLSTATE;
+END; $$;
+SELECT cov_int4_min_div();
+ cov_int4_min_div 
+------------------
+ 22003
+(1 row)
+
+CREATE FUNCTION cov_int4_min_mod() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE a int := -2147483648; b int := -1; r int;
+BEGIN
+  r := a % b;
+  RETURN r::text;
+EXCEPTION WHEN others THEN RETURN SQLSTATE;
+END; $$;
+SELECT cov_int4_min_mod();
+ cov_int4_min_mod 
+------------------
+ 0
+(1 row)
+
+CREATE FUNCTION cov_int8_min_div() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE a bigint := -9223372036854775808; b bigint := -1; r bigint;
+BEGIN
+  r := a / b;
+  RETURN r::text;
+EXCEPTION WHEN others THEN RETURN SQLSTATE;
+END; $$;
+SELECT cov_int8_min_div();
+ cov_int8_min_div 
+------------------
+ 22003
+(1 row)
+
+CREATE FUNCTION cov_int8_min_mod() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE a bigint := -9223372036854775808; b bigint := -1; r bigint;
+BEGIN
+  r := a % b;
+  RETURN r::text;
+EXCEPTION WHEN others THEN RETURN SQLSTATE;
+END; $$;
+SELECT cov_int8_min_mod();
+ cov_int8_min_mod 
+------------------
+ 0
+(1 row)
+
+CREATE FUNCTION cov_int4_neg_min() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE a int := -2147483648; r int;
+BEGIN
+  r := -a;
+  RETURN r::text;
+EXCEPTION WHEN others THEN RETURN SQLSTATE;
+END; $$;
+SELECT cov_int4_neg_min();
+ cov_int4_neg_min 
+------------------
+ 22003
+(1 row)
+
+CREATE FUNCTION cov_int4_add_ovf() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE a int := 2147483647; b int := 1; r int;
+BEGIN
+  r := a + b;
+  RETURN r::text;
+EXCEPTION WHEN numeric_value_out_of_range THEN RETURN 'ovf';
+END; $$;
+SELECT cov_int4_add_ovf();
+ cov_int4_add_ovf 
+------------------
+ ovf
+(1 row)
+
+CREATE FUNCTION cov_int4_mul_ovf() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE a int := 2147483647; b int := 2; r int;
+BEGIN
+  r := a * b;
+  RETURN r::text;
+EXCEPTION WHEN numeric_value_out_of_range THEN RETURN 'ovf';
+END; $$;
+SELECT cov_int4_mul_ovf();
+ cov_int4_mul_ovf 
+------------------
+ ovf
+(1 row)
+
+CREATE FUNCTION cov_int4_div_zero() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE a int := 1; b int := 0; r int;
+BEGIN
+  r := a / b;
+  RETURN r::text;
+EXCEPTION WHEN division_by_zero THEN RETURN 'div0';
+END; $$;
+SELECT cov_int4_div_zero();
+ cov_int4_div_zero 
+-------------------
+ div0
+(1 row)
+
+CREATE FUNCTION cov_int4_mod_zero() RETURNS text LANGUAGE uplpgsql AS $$
+DECLARE a int := 1; b int := 0; r int;
+BEGIN
+  r := a % b;
+  RETURN r::text;
+EXCEPTION WHEN division_by_zero THEN RETURN 'mod0';
+END; $$;
+SELECT cov_int4_mod_zero();
+ cov_int4_mod_zero 
+-------------------
+ mod0
+(1 row)
+
+--
+-- extra_warnings / extra_errors
+--
+-- These are applied by the validator, which must compile with forValidator
+-- true; otherwise do_compile() zeroes both and the checks silently never run.
+--
+SET uplpgsql.extra_warnings TO 'shadowed_variables';
+-- should WARN
+CREATE FUNCTION cov_shadow_warn() RETURNS int LANGUAGE uplpgsql AS $$
+DECLARE x int := 1;
+BEGIN
+  DECLARE x int := 2;
+  BEGIN
+    RETURN x;
+  END;
+END; $$;
+WARNING:  variable "x" shadows a previously defined variable
+LINE 4:   DECLARE x int := 2;
+                  ^
+RESET uplpgsql.extra_warnings;
+SET uplpgsql.extra_errors TO 'shadowed_variables';
+-- should ERROR
+CREATE FUNCTION cov_shadow_err() RETURNS int LANGUAGE uplpgsql AS $$
+DECLARE x int := 1;
+BEGIN
+  DECLARE x int := 2;
+  BEGIN
+    RETURN x;
+  END;
+END; $$;
+ERROR:  variable "x" shadows a previously defined variable
+LINE 4:   DECLARE x int := 2;
+                  ^
+RESET uplpgsql.extra_errors;
+-- no shadowing: must stay silent even with the check on
+SET uplpgsql.extra_errors TO 'shadowed_variables';
+CREATE FUNCTION cov_noshadow() RETURNS int LANGUAGE uplpgsql AS $$
+DECLARE x int := 1;
+BEGIN
+  DECLARE y int := 2;
+  BEGIN
+    RETURN x + y;
+  END;
+END; $$;
+SELECT cov_noshadow();
+ cov_noshadow 
+--------------
+            3
+(1 row)
+
+RESET uplpgsql.extra_errors;
+-- strict_multi_assignment: too many source columns
+SET uplpgsql.extra_errors TO 'strict_multi_assignment';
+CREATE FUNCTION cov_strict_multi() RETURNS int LANGUAGE uplpgsql AS $$
+DECLARE a int; b int;
+BEGIN
+  SELECT 1, 2, 3 INTO a, b;
+  RETURN a;
+END; $$;
+SELECT cov_strict_multi();
+ERROR:  number of source and target fields in assignment does not match
+DETAIL:  strict_multi_assignment check of extra_errors is active.
+HINT:  Make sure the query returns the exact list of columns.
+CONTEXT:  PL/pgSQL function cov_strict_multi() line 4 at SQL statement
+-- too few source columns
+CREATE FUNCTION cov_strict_multi_few() RETURNS int LANGUAGE uplpgsql AS $$
+DECLARE a int; b int;
+BEGIN
+  SELECT 1 INTO a, b;
+  RETURN a;
+END; $$;
+SELECT cov_strict_multi_few();
+ERROR:  number of source and target fields in assignment does not match
+DETAIL:  strict_multi_assignment check of extra_errors is active.
+HINT:  Make sure the query returns the exact list of columns.
+CONTEXT:  PL/pgSQL function cov_strict_multi_few() line 4 at SQL statement
+RESET uplpgsql.extra_errors;
+-- with the check off, the same function is fine
+CREATE FUNCTION cov_lax_multi() RETURNS int LANGUAGE uplpgsql AS $$
+DECLARE a int; b int;
+BEGIN
+  SELECT 1, 2, 3 INTO a, b;
+  RETURN a;
+END; $$;
+SELECT cov_lax_multi();
+ cov_lax_multi 
+---------------
+             1
+(1 row)
+
+--
+-- Event triggers (interpreter-only dispatch: no JIT path)
+--
+CREATE FUNCTION cov_evt() RETURNS event_trigger LANGUAGE uplpgsql AS $$
+BEGIN
+  RAISE NOTICE 'event trigger: % %', TG_EVENT, TG_TAG;
+END; $$;
+CREATE EVENT TRIGGER cov_evt_start ON ddl_command_start EXECUTE FUNCTION cov_evt();
+CREATE TABLE cov_evt_probe(i int);
+NOTICE:  event trigger: ddl_command_start CREATE TABLE
+DROP TABLE cov_evt_probe;
+NOTICE:  event trigger: ddl_command_start DROP TABLE
+DROP EVENT TRIGGER cov_evt_start;
+-- sql_drop, which carries a different event name
+CREATE FUNCTION cov_evt_drop() RETURNS event_trigger LANGUAGE uplpgsql AS $$
+BEGIN
+  RAISE NOTICE 'sql_drop fired: %', TG_EVENT;
+END; $$;
+CREATE EVENT TRIGGER cov_evt_sqldrop ON sql_drop EXECUTE FUNCTION cov_evt_drop();
+CREATE TABLE cov_evt_probe2(i int);
+DROP TABLE cov_evt_probe2;
+NOTICE:  sql_drop fired: sql_drop
+DROP EVENT TRIGGER cov_evt_sqldrop;
+-- cleanup
+DROP FUNCTION cov_rowcount();
+DROP FUNCTION cov_rowcount_upd();
+DROP FUNCTION cov_rowcount_zero();
+DROP FUNCTION cov_pg_context();
+DROP FUNCTION cov_stacked();
+DROP FUNCTION cov_stacked_div();
+DROP FUNCTION cov_table(int);
+DROP FUNCTION cov_table_query(int);
+DROP FUNCTION cov_setof();
+DROP TYPE cov_pair;
+DROP FUNCTION cov_return_query_exec();
+DROP FUNCTION cov_int4_min_div();
+DROP FUNCTION cov_int4_min_mod();
+DROP FUNCTION cov_int8_min_div();
+DROP FUNCTION cov_int8_min_mod();
+DROP FUNCTION cov_int4_neg_min();
+DROP FUNCTION cov_int4_add_ovf();
+DROP FUNCTION cov_int4_mul_ovf();
+DROP FUNCTION cov_int4_div_zero();
+DROP FUNCTION cov_int4_mod_zero();
+DROP FUNCTION cov_shadow_warn();
+DROP FUNCTION cov_noshadow();
+DROP FUNCTION cov_strict_multi();
+DROP FUNCTION cov_strict_multi_few();
+DROP FUNCTION cov_lax_multi();
+DROP FUNCTION cov_evt();
+DROP FUNCTION cov_evt_drop();
+DROP TABLE cov_gd;
+--
+-- NULL through arithmetic and comparison.
+--
+-- Every operator Tier 1 compiles is strict, so a NULL operand makes the whole
+-- expression NULL.  Reading the variable's datum without consulting its isnull
+-- flag silently treats NULL as zero.
+--
+create function nul_add() returns text language uplpgsql as $$
+declare a int; b int := 1; r int; begin r := a + b; return coalesce(r::text,'NULL'); end; $$;
+select nul_add();
+ nul_add 
+---------
+ NULL
+(1 row)
+
+create function nul_add_rev() returns text language uplpgsql as $$
+declare a int := 1; b int; r int; begin r := a + b; return coalesce(r::text,'NULL'); end; $$;
+select nul_add_rev();
+ nul_add_rev 
+-------------
+ NULL
+(1 row)
+
+create function nul_sub() returns text language uplpgsql as $$
+declare a int; b int := 1; r int; begin r := a - b; return coalesce(r::text,'NULL'); end; $$;
+select nul_sub();
+ nul_sub 
+---------
+ NULL
+(1 row)
+
+create function nul_mul() returns text language uplpgsql as $$
+declare a int; b int := 2; r int; begin r := a * b; return coalesce(r::text,'NULL'); end; $$;
+select nul_mul();
+ nul_mul 
+---------
+ NULL
+(1 row)
+
+create function nul_div() returns text language uplpgsql as $$
+declare a int; b int := 2; r int; begin r := a / b; return coalesce(r::text,'NULL'); end; $$;
+select nul_div();
+ nul_div 
+---------
+ NULL
+(1 row)
+
+create function nul_mod() returns text language uplpgsql as $$
+declare a int; b int := 2; r int; begin r := a % b; return coalesce(r::text,'NULL'); end; $$;
+select nul_mod();
+ nul_mod 
+---------
+ NULL
+(1 row)
+
+create function nul_neg() returns text language uplpgsql as $$
+declare a int; r int; begin r := -a; return coalesce(r::text,'NULL'); end; $$;
+select nul_neg();
+ nul_neg 
+---------
+ NULL
+(1 row)
+
+create function nul_both() returns text language uplpgsql as $$
+declare a int; b int; r int; begin r := a + b; return coalesce(r::text,'NULL'); end; $$;
+select nul_both();
+ nul_both 
+----------
+ NULL
+(1 row)
+
+create function nul_int8() returns text language uplpgsql as $$
+declare a bigint; b bigint := 1; r bigint; begin r := a + b; return coalesce(r::text,'NULL'); end; $$;
+select nul_int8();
+ nul_int8 
+----------
+ NULL
+(1 row)
+
+create function nul_float8() returns text language uplpgsql as $$
+declare a float8; b float8 := 1; r float8; begin r := a + b; return coalesce(r::text,'NULL'); end; $$;
+select nul_float8();
+ nul_float8 
+------------
+ NULL
+(1 row)
+
+-- a NULL operand must not reach the division: PostgreSQL returns NULL rather
+-- than raising division_by_zero, because the strict operator is never invoked
+create function nul_div_zero() returns text language uplpgsql as $$
+declare a int; b int := 0; r int;
+begin r := a / b; return coalesce(r::text,'NULL');
+exception when division_by_zero then return 'div0'; end; $$;
+select nul_div_zero();
+ nul_div_zero 
+--------------
+ NULL
+(1 row)
+
+-- non-NULL arithmetic must be unaffected
+create function nul_ok() returns text language uplpgsql as $$
+declare a int := 7; b int := 3; r int; begin r := a * b + 1; return r::text; end; $$;
+select nul_ok();
+ nul_ok 
+--------
+ 22
+(1 row)
+
+-- comparisons: a NULL operand makes the condition NULL, which is not true
+create function nul_lt() returns text language uplpgsql as $$
+declare a int; b int := 1; begin if a < b then return 'true'; else return 'false-or-null'; end if; end; $$;
+select nul_lt();
+    nul_lt     
+---------------
+ false-or-null
+(1 row)
+
+create function nul_eq() returns text language uplpgsql as $$
+declare a int; b int := 1; begin if a = b then return 'true'; else return 'false-or-null'; end if; end; $$;
+select nul_eq();
+    nul_eq     
+---------------
+ false-or-null
+(1 row)
+
+create function nul_gt() returns text language uplpgsql as $$
+declare a int; b int := 1; begin if a > b then return 'true'; else return 'false-or-null'; end if; end; $$;
+select nul_gt();
+    nul_gt     
+---------------
+ false-or-null
+(1 row)
+
+create function nul_while() returns int language uplpgsql as $$
+declare a int; n int := 0; begin while a < 5 loop n := n + 1; exit when n > 2; end loop; return n; end; $$;
+select nul_while();
+ nul_while 
+-----------
+         0
+(1 row)
+
+create function nul_exit_when() returns int language uplpgsql as $$
+declare a int; n int := 0; begin loop n := n + 1; exit when a > 0; exit when n > 4; end loop; return n; end; $$;
+select nul_exit_when();
+ nul_exit_when 
+---------------
+             5
+(1 row)
+
+--
+-- Three-valued logic: AND/OR/NOT are the only non-strict operators.
+--
+create function tvl_and_true() returns text language uplpgsql as $$
+declare a bool; r bool; begin r := a and true; return coalesce(r::text,'NULL'); end; $$;
+select tvl_and_true();
+ tvl_and_true 
+--------------
+ NULL
+(1 row)
+
+create function tvl_and_false() returns text language uplpgsql as $$
+declare a bool; b bool := false; r bool; begin r := a and b; return coalesce(r::text,'NULL'); end; $$;
+select tvl_and_false();
+ tvl_and_false 
+---------------
+ false
+(1 row)
+
+create function tvl_or_true() returns text language uplpgsql as $$
+declare a bool; b bool := true; r bool; begin r := a or b; return coalesce(r::text,'NULL'); end; $$;
+select tvl_or_true();
+ tvl_or_true 
+-------------
+ true
+(1 row)
+
+create function tvl_or_false() returns text language uplpgsql as $$
+declare a bool; b bool := false; r bool; begin r := a or b; return coalesce(r::text,'NULL'); end; $$;
+select tvl_or_false();
+ tvl_or_false 
+--------------
+ NULL
+(1 row)
+
+create function tvl_not_null() returns text language uplpgsql as $$
+declare a bool; r bool; begin r := not a; return coalesce(r::text,'NULL'); end; $$;
+select tvl_not_null();
+ tvl_not_null 
+--------------
+ NULL
+(1 row)
+
+create function tvl_and_null() returns text language uplpgsql as $$
+declare a bool; b bool; r bool; begin r := a and b; return coalesce(r::text,'NULL'); end; $$;
+select tvl_and_null();
+ tvl_and_null 
+--------------
+ NULL
+(1 row)
+
+create function tvl_3arg_and() returns text language uplpgsql as $$
+declare a bool := true; b bool; c bool := false; r bool; begin r := a and b and c; return coalesce(r::text,'NULL'); end; $$;
+select tvl_3arg_and();
+ tvl_3arg_and 
+--------------
+ false
+(1 row)
+
+create function tvl_3arg_or() returns text language uplpgsql as $$
+declare a bool := false; b bool; c bool := true; r bool; begin r := a or b or c; return coalesce(r::text,'NULL'); end; $$;
+select tvl_3arg_or();
+ tvl_3arg_or 
+-------------
+ true
+(1 row)
+
+-- ordinary two-valued cases must still work
+create function tvl_plain() returns text language uplpgsql as $$
+declare a bool := true; b bool := false; begin return (a and b)::text || '/' || (a or b)::text || '/' || (not a)::text; end; $$;
+select tvl_plain();
+    tvl_plain     
+------------------
+ false/true/false
+(1 row)
+
+-- IF treats a NULL condition as not-true
+create function tvl_if_not_null() returns text language uplpgsql as $$
+declare a bool; begin if not a then return 'T'; else return 'F-or-N'; end if; end; $$;
+select tvl_if_not_null();
+ tvl_if_not_null 
+-----------------
+ F-or-N
+(1 row)
+
+create function tvl_if_or_true() returns text language uplpgsql as $$
+declare a bool; b bool := true; begin if a or b then return 'T'; else return 'F-or-N'; end if; end; $$;
+select tvl_if_or_true();
+ tvl_if_or_true 
+----------------
+ T
+(1 row)
+
+create function tvl_if_and_true() returns text language uplpgsql as $$
+declare a bool; b bool := true; begin if a and b then return 'T'; else return 'F-or-N'; end if; end; $$;
+select tvl_if_and_true();
+ tvl_if_and_true 
+-----------------
+ F-or-N
+(1 row)
+
+--
+-- float8 semantics: PostgreSQL's operators raise where IEEE would saturate,
+-- and order NaN above every other value.
+--
+create function flt_div_zero() returns text language uplpgsql as $$
+declare a float8 := 1; b float8 := 0; r float8;
+begin r := a / b; return r::text;
+exception when division_by_zero then return 'div0'; end; $$;
+select flt_div_zero();
+ flt_div_zero 
+--------------
+ div0
+(1 row)
+
+create function flt_overflow() returns text language uplpgsql as $$
+declare a float8 := 1e308; b float8 := 10; r float8;
+begin r := a * b; return r::text;
+exception when others then return sqlstate; end; $$;
+select flt_overflow();
+ flt_overflow 
+--------------
+ 22003
+(1 row)
+
+create function flt_underflow() returns text language uplpgsql as $$
+declare a float8 := 1e-320; b float8 := 1e10; r float8;
+begin r := a / b; return r::text;
+exception when others then return sqlstate; end; $$;
+select flt_underflow();
+ flt_underflow 
+---------------
+ 22003
+(1 row)
+
+create function flt_nan_gt() returns text language uplpgsql as $$
+declare a float8 := 'NaN'; b float8 := 1; begin if a > b then return 'gt'; else return 'not-gt'; end if; end; $$;
+select flt_nan_gt();
+ flt_nan_gt 
+------------
+ gt
+(1 row)
+
+create function flt_gt_nan() returns text language uplpgsql as $$
+declare a float8 := 1; b float8 := 'NaN'; begin if a > b then return 'gt'; else return 'not-gt'; end if; end; $$;
+select flt_gt_nan();
+ flt_gt_nan 
+------------
+ not-gt
+(1 row)
+
+create function flt_nan_eq() returns text language uplpgsql as $$
+declare a float8 := 'NaN'; b float8 := 'NaN'; begin if a = b then return 'eq'; else return 'ne'; end if; end; $$;
+select flt_nan_eq();
+ flt_nan_eq 
+------------
+ eq
+(1 row)
+
+create function flt_nan_ne() returns text language uplpgsql as $$
+declare a float8 := 'NaN'; b float8 := 1; begin if a <> b then return 'ne'; else return 'eq'; end if; end; $$;
+select flt_nan_ne();
+ flt_nan_ne 
+------------
+ ne
+(1 row)
+
+create function flt_inf() returns text language uplpgsql as $$
+declare a float8 := 'Infinity'; b float8 := 1; r float8; begin r := a + b; return r::text; end; $$;
+select flt_inf();
+ flt_inf  
+----------
+ Infinity
+(1 row)
+
+create function flt_normal() returns text language uplpgsql as $$
+declare a float8 := 1.5; b float8 := 2; r float8; begin r := a * b + 1; return r::text; end; $$;
+select flt_normal();
+ flt_normal 
+------------
+ 4
+(1 row)
+
+create function flt_neg_zero() returns text language uplpgsql as $$
+declare a float8 := -0.0; b float8 := 0.0; begin if a = b then return 'eq'; else return 'ne'; end if; end; $$;
+select flt_neg_zero();
+ flt_neg_zero 
+--------------
+ eq
+(1 row)
+
+drop function nul_add(); drop function nul_add_rev(); drop function nul_sub();
+drop function nul_mul(); drop function nul_div(); drop function nul_mod();
+drop function nul_neg(); drop function nul_both(); drop function nul_int8();
+drop function nul_float8(); drop function nul_div_zero(); drop function nul_ok();
+drop function nul_lt(); drop function nul_eq(); drop function nul_gt();
+drop function nul_while(); drop function nul_exit_when();
+drop function tvl_and_true(); drop function tvl_and_false(); drop function tvl_or_true();
+drop function tvl_or_false(); drop function tvl_not_null(); drop function tvl_and_null();
+drop function tvl_3arg_and(); drop function tvl_3arg_or(); drop function tvl_plain();
+drop function tvl_if_not_null(); drop function tvl_if_or_true(); drop function tvl_if_and_true();
+drop function flt_div_zero(); drop function flt_overflow(); drop function flt_underflow();
+drop function flt_nan_gt(); drop function flt_gt_nan(); drop function flt_nan_eq();
+drop function flt_nan_ne(); drop function flt_inf(); drop function flt_normal();
+drop function flt_neg_zero();

@@ -663,8 +663,17 @@ uplpgsql_validator(PG_FUNCTION_ARGS)
 			fake_fcinfo->context = (Node *) &etrigdata;
 		}
 
-		/* Test-compile the function */
-		uplpgsql_compile(fake_fcinfo, is_trigger || is_event_trigger);
+		/*
+		 * Test-compile the function.
+		 *
+		 * forValidator must be true — we are the validator.  It is what
+		 * enables the extra syntax checks, the extra_warnings/extra_errors
+		 * checks, polymorphic return-type resolution, and source-position
+		 * reporting in compile errors; do_compile() zeroes all of that when
+		 * it is false.  The trigger flags are conveyed via fake_fcinfo's
+		 * context, set above, not through this argument.
+		 */
+		uplpgsql_compile(fake_fcinfo, true);
 
 		if ((rc = SPI_finish()) != SPI_OK_FINISH)
 			elog(ERROR, "SPI_finish failed: %s", SPI_result_code_string(rc));

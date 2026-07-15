@@ -248,14 +248,6 @@ $$ LANGUAGE uplpgsql;
 ERROR:  CONTINUE cannot be used outside a loop
 LINE 4:         continue;
                 ^
-QUERY:  
-begin
-    begin
-        continue;
-    end;
-end;
-
-CONTEXT:  compilation of PL/pgSQL function "continue_error1" near line 4
 -- should fail: unlabeled EXIT is only legal inside a loop
 create function exit_error1() returns void as $$
 begin
@@ -267,14 +259,6 @@ $$ LANGUAGE uplpgsql;
 ERROR:  EXIT cannot be used outside a loop, unless it has a label
 LINE 4:         exit;
                 ^
-QUERY:  
-begin
-    begin
-        exit;
-    end;
-end;
-
-CONTEXT:  compilation of PL/pgSQL function "exit_error1" near line 4
 -- should fail: no such label
 create function continue_error2() returns void as $$
 begin
@@ -288,16 +272,6 @@ $$ LANGUAGE uplpgsql;
 ERROR:  there is no label "no_such_label" attached to any block or loop enclosing this statement
 LINE 5:             continue no_such_label;
                              ^
-QUERY:  
-begin
-    begin
-        loop
-            continue no_such_label;
-        end loop;
-    end;
-end;
-
-CONTEXT:  compilation of PL/pgSQL function "continue_error2" near line 5
 -- should fail: no such label
 create function exit_error2() returns void as $$
 begin
@@ -311,16 +285,6 @@ $$ LANGUAGE uplpgsql;
 ERROR:  there is no label "no_such_label" attached to any block or loop enclosing this statement
 LINE 5:             exit no_such_label;
                          ^
-QUERY:  
-begin
-    begin
-        loop
-            exit no_such_label;
-        end loop;
-    end;
-end;
-
-CONTEXT:  compilation of PL/pgSQL function "exit_error2" near line 5
 -- should fail: CONTINUE can't reference the label of a named block
 create function continue_error3() returns void as $$
 begin
@@ -335,17 +299,6 @@ $$ LANGUAGE uplpgsql;
 ERROR:  block label "begin_block1" cannot be used in CONTINUE
 LINE 6:             continue begin_block1;
                              ^
-QUERY:  
-begin
-    <<begin_block1>>
-    begin
-        loop
-            continue begin_block1;
-        end loop;
-    end;
-end;
-
-CONTEXT:  compilation of PL/pgSQL function "continue_error3" near line 6
 -- On the other hand, EXIT *can* reference the label of a named block
 create function exit_block1() returns void as $$
 begin
@@ -396,14 +349,6 @@ $$ LANGUAGE uplpgsql;
 ERROR:  end label "flbl1" specified for unlabeled block
 LINE 5:   end loop flbl1;
                    ^
-QUERY:  
-begin
-  for _i in 1 .. 10 loop
-    exit;
-  end loop flbl1;
-end;
-
-CONTEXT:  compilation of PL/pgSQL function "end_label2" near line 3
 -- should fail: end label does not match start label
 create function end_label3() returns void as $$
 <<outer_label>>
@@ -417,16 +362,6 @@ $$ LANGUAGE uplpgsql;
 ERROR:  end label "outer_label" differs from block's label "inner_label"
 LINE 7:   end loop outer_label;
                    ^
-QUERY:  
-<<outer_label>>
-begin
-  <<inner_label>>
-  for _i in 1 .. 10 loop
-    exit;
-  end loop outer_label;
-end;
-
-CONTEXT:  compilation of PL/pgSQL function "end_label3" near line 5
 -- should fail: end label on a block without a start label
 create function end_label4() returns void as $$
 <<outer_label>>
@@ -439,15 +374,6 @@ $$ LANGUAGE uplpgsql;
 ERROR:  end label "outer_label" specified for unlabeled block
 LINE 6:   end loop outer_label;
                    ^
-QUERY:  
-<<outer_label>>
-begin
-  for _i in 1 .. 10 loop
-    exit;
-  end loop outer_label;
-end;
-
-CONTEXT:  compilation of PL/pgSQL function "end_label4" near line 4
 -- unlabeled exit matches no blocks
 do LANGUAGE uplpgsql $$
 begin

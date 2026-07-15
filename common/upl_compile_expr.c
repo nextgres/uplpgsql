@@ -509,6 +509,104 @@ uplpgsql_emit_load_param_isnull(UPLpgSQL_compile_ctx *ctx,
 }
 
 /*
+ * OR together the isnull flags of every leaf of a Tier 1 expression.
+ *
+ * Every operator Tier 1 accepts is strict — int4/int8 arithmetic, the
+ * comparison operators, and the numeric casts all return NULL if any input is
+ * NULL — so an expression is NULL exactly when some leaf is.  That lets the
+ * caller decide nullness once, up front, instead of threading an isnull flag
+ * through each node.  uplpgsql_classify_expr() keeps the non-strict operators
+ * (AND/OR/NOT) out of Tier 1 precisely so this holds.
+ *
+ * Constants are never null here: classify_expr() rejects a null Const.
+ *
+ * Returns an i1, or NULL if the expression has no nullable leaf at all (a
+ * constant expression), letting the caller skip the check entirely.
+ */
+static LLVMValueRef
+tier1_expr_any_null(UPLpgSQL_compile_ctx *ctx, Expr *expr,
+					LLVMValueRef estate_ref)
+{
+	LLVMBuilderRef	builder = ctx->builder;
+
+	if (expr == NULL)
+		return NULL;
+
+	switch (nodeTag(expr))
+	{
+		case T_Const:
+			/* classify_expr() rejects null Consts, so this is never null */
+			return NULL;
+
+		case T_Param:
+			{
+				Param *p = (Param *) expr;
+
+				return uplpgsql_emit_load_param_isnull(ctx, estate_ref,
+													  p->paramid - 1);
+			}
+
+		case T_RelabelType:
+			return tier1_expr_any_null(ctx, ((RelabelType *) expr)->arg,
+									   estate_ref);
+
+		case T_SubscriptingRef:
+			{
+				/*
+				 * A native array read: null if the array variable is null, or
+				 * if the subscript is.  (Out-of-range is a runtime error, not
+				 * a null, so there is nothing more to fold in here.)
+				 */
+				SubscriptingRef *s = (SubscriptingRef *) expr;
+				LLVMValueRef	acc = NULL;
+				ListCell	   *lc;
+
+				acc = tier1_expr_any_null(ctx, s->refexpr, estate_ref);
+				foreach(lc, s->refupperindexpr)
+				{
+					LLVMValueRef v = tier1_expr_any_null(ctx,
+														 (Expr *) lfirst(lc),
+														 estate_ref);
+					if (v == NULL)
+						continue;
+					acc = (acc == NULL) ? v
+						: LLVMBuildOr(builder, acc, v, "anynull");
+				}
+				return acc;
+			}
+
+		case T_OpExpr:
+		case T_FuncExpr:
+			{
+				List	   *args = IsA(expr, OpExpr) ? ((OpExpr *) expr)->args
+													 : ((FuncExpr *) expr)->args;
+				LLVMValueRef acc = NULL;
+				ListCell   *lc;
+
+				foreach(lc, args)
+				{
+					LLVMValueRef v = tier1_expr_any_null(ctx,
+														 (Expr *) lfirst(lc),
+														 estate_ref);
+					if (v == NULL)
+						continue;
+					acc = (acc == NULL) ? v
+						: LLVMBuildOr(builder, acc, v, "anynull");
+				}
+				return acc;
+			}
+
+		default:
+			/*
+			 * Unreachable: classify_expr() admits nothing else into Tier 1.
+			 * Be conservative anyway and claim it might be null, which costs
+			 * only the fallback path.
+			 */
+			return LLVMConstInt(ctx->types[UPLPGSQL_INT1], 1, false);
+	}
+}
+
+/*
  * Emit IR to store a Datum (i64) into a variable.
  * Sets value, isnull=false, freeval=false.
  */
@@ -548,6 +646,97 @@ uplpgsql_emit_store_var_datum(UPLpgSQL_compile_ctx *ctx,
 	/* datum->freeval = false */
 	off = LLVMConstInt(i64, OFF_VAR_FREEVAL, false);
 	gep = LLVMBuildGEP2(builder, i8, datum, &off, 1, "st.freeval.ptr");
+	LLVMBuildStore(builder, LLVMConstInt(i8, 0, false), gep);
+}
+
+/*
+ * Emit IR to store a Datum plus a computed isnull (i1) into a variable.
+ *
+ * Like uplpgsql_emit_store_var_datum(), but takes nullness from a value
+ * rather than assuming not-null.  Pass-by-value targets only.
+ */
+static void
+uplpgsql_emit_store_var_datum_isnull(UPLpgSQL_compile_ctx *ctx,
+									 LLVMValueRef estate_ref, int dno,
+									 LLVMValueRef datum_val,
+									 LLVMValueRef isnull_val)
+{
+	LLVMBuilderRef	builder = ctx->builder;
+	LLVMTypeRef		i8 = ctx->types[UPLPGSQL_INT8];
+	LLVMTypeRef		i64 = ctx->types[UPLPGSQL_INT64];
+	LLVMTypeRef		ptr = ctx->types[UPLPGSQL_PTR];
+	LLVMValueRef	off, gep, plstate, datums, datum;
+
+	off = LLVMConstInt(i64, OFF_ESTATE_PLSTATE, false);
+	gep = LLVMBuildGEP2(builder, i8, estate_ref, &off, 1, "si.plstate.ptr");
+	plstate = LLVMBuildLoad2(builder, ptr, gep, "si.plstate");
+
+	off = LLVMConstInt(i64, OFF_EXECSTATE_DATUMS, false);
+	gep = LLVMBuildGEP2(builder, i8, plstate, &off, 1, "si.datums.ptr");
+	datums = LLVMBuildLoad2(builder, ptr, gep, "si.datums");
+
+	off = LLVMConstInt(i64, dno, false);
+	gep = LLVMBuildGEP2(builder, ptr, datums, &off, 1, "si.datum.slot");
+	datum = LLVMBuildLoad2(builder, ptr, gep, "si.datum");
+
+	off = LLVMConstInt(i64, OFF_VAR_VALUE, false);
+	gep = LLVMBuildGEP2(builder, i8, datum, &off, 1, "si.value.ptr");
+	LLVMBuildStore(builder, datum_val, gep);
+
+	off = LLVMConstInt(i64, OFF_VAR_ISNULL, false);
+	gep = LLVMBuildGEP2(builder, i8, datum, &off, 1, "si.isnull.ptr");
+	LLVMBuildStore(builder,
+				   LLVMBuildZExt(builder, isnull_val, i8, "si.isnull.i8"),
+				   gep);
+
+	off = LLVMConstInt(i64, OFF_VAR_FREEVAL, false);
+	gep = LLVMBuildGEP2(builder, i8, datum, &off, 1, "si.freeval.ptr");
+	LLVMBuildStore(builder, LLVMConstInt(i8, 0, false), gep);
+}
+
+/*
+ * Emit IR to set a variable to NULL: value = 0, isnull = true.
+ *
+ * The pass-by-value counterpart of uplpgsql_emit_store_var_datum(), which
+ * always clears isnull.  Only valid for pass-by-value targets — a
+ * pass-by-reference variable would need assign_simple_var() to release its
+ * old value, which is why Tier 1 only ever assigns scalars.
+ */
+static void
+uplpgsql_emit_store_var_null(UPLpgSQL_compile_ctx *ctx,
+							 LLVMValueRef estate_ref, int dno)
+{
+	LLVMBuilderRef	builder = ctx->builder;
+	LLVMTypeRef		i8 = ctx->types[UPLPGSQL_INT8];
+	LLVMTypeRef		i64 = ctx->types[UPLPGSQL_INT64];
+	LLVMTypeRef		ptr = ctx->types[UPLPGSQL_PTR];
+	LLVMValueRef	off, gep, plstate, datums, datum;
+
+	off = LLVMConstInt(i64, OFF_ESTATE_PLSTATE, false);
+	gep = LLVMBuildGEP2(builder, i8, estate_ref, &off, 1, "sn.plstate.ptr");
+	plstate = LLVMBuildLoad2(builder, ptr, gep, "sn.plstate");
+
+	off = LLVMConstInt(i64, OFF_EXECSTATE_DATUMS, false);
+	gep = LLVMBuildGEP2(builder, i8, plstate, &off, 1, "sn.datums.ptr");
+	datums = LLVMBuildLoad2(builder, ptr, gep, "sn.datums");
+
+	off = LLVMConstInt(i64, dno, false);
+	gep = LLVMBuildGEP2(builder, ptr, datums, &off, 1, "sn.datum.slot");
+	datum = LLVMBuildLoad2(builder, ptr, gep, "sn.datum");
+
+	/* datum->value = 0 */
+	off = LLVMConstInt(i64, OFF_VAR_VALUE, false);
+	gep = LLVMBuildGEP2(builder, i8, datum, &off, 1, "sn.value.ptr");
+	LLVMBuildStore(builder, LLVMConstInt(i64, 0, false), gep);
+
+	/* datum->isnull = true */
+	off = LLVMConstInt(i64, OFF_VAR_ISNULL, false);
+	gep = LLVMBuildGEP2(builder, i8, datum, &off, 1, "sn.isnull.ptr");
+	LLVMBuildStore(builder, LLVMConstInt(i8, 1, false), gep);
+
+	/* datum->freeval = false */
+	off = LLVMConstInt(i64, OFF_VAR_FREEVAL, false);
+	gep = LLVMBuildGEP2(builder, i8, datum, &off, 1, "sn.freeval.ptr");
 	LLVMBuildStore(builder, LLVMConstInt(i8, 0, false), gep);
 }
 
@@ -741,19 +930,22 @@ uplpgsql_classify_expr(Expr *expr)
 					return EXPR_TYPE_INT8;
 				}
 
-				/* float8 arithmetic */
-				if (fid == F_FLOAT8PL || fid == F_FLOAT8MI ||
-					fid == F_FLOAT8MUL || fid == F_FLOAT8DIV ||
-					fid == F_FLOAT8UM)
-				{
-					ListCell *lc;
-					foreach(lc, op->args)
-					{
-						if (uplpgsql_classify_expr((Expr *) lfirst(lc)) != EXPR_TYPE_FLOAT8)
-							return EXPR_TYPE_UNKNOWN;
-					}
-					return EXPR_TYPE_FLOAT8;
-				}
+				/*
+				 * float8 arithmetic is deliberately NOT Tier 1.
+				 *
+				 * PostgreSQL's float8 operators are not the raw IEEE
+				 * instructions: float8_div() raises division_by_zero rather
+				 * than returning Infinity, and every operator raises
+				 * numeric_value_out_of_range on overflow/underflow instead of
+				 * saturating (see float8_pl/_mi/_mul/_div in utils/float.h).
+				 * Emitting fadd/fdiv inline silently drops all of that.
+				 *
+				 * Leaving these unclassified sends them to Tier 2, which
+				 * calls the real float8_* functions and so inherits their
+				 * semantics exactly.  float8 Consts, Params and array
+				 * subscripts stay classified below, so native array reads
+				 * are unaffected.
+				 */
 
 				/* int4 comparisons → bool */
 				if (fid == F_INT4EQ || fid == F_INT4NE ||
@@ -781,18 +973,14 @@ uplpgsql_classify_expr(Expr *expr)
 					return EXPR_TYPE_BOOL;
 				}
 
-				/* float8 comparisons → bool */
-				if (fid == F_FLOAT8EQ || fid == F_FLOAT8NE ||
-					fid == F_FLOAT8LT || fid == F_FLOAT8LE ||
-					fid == F_FLOAT8GT || fid == F_FLOAT8GE)
-				{
-					if (list_length(op->args) != 2)
-						return EXPR_TYPE_UNKNOWN;
-					if (uplpgsql_classify_expr(linitial(op->args)) != EXPR_TYPE_FLOAT8 ||
-						uplpgsql_classify_expr(lsecond(op->args)) != EXPR_TYPE_FLOAT8)
-						return EXPR_TYPE_UNKNOWN;
-					return EXPR_TYPE_BOOL;
-				}
+				/*
+				 * float8 comparisons are deliberately NOT Tier 1 either.
+				 *
+				 * LLVM's ordered predicates are false whenever an operand is
+				 * NaN, but PostgreSQL sorts NaN above every other value and
+				 * treats NaN = NaN as true (float8_eq/_gt in utils/float.h).
+				 * Tier 2 calls those functions and gets it right.
+				 */
 
 				/* bool equality/inequality → bool */
 				if (fid == F_BOOLEQ || fid == F_BOOLNE)
@@ -940,17 +1128,16 @@ uplpgsql_classify_expr(Expr *expr)
 			return uplpgsql_classify_expr(((RelabelType *) expr)->arg);
 
 		case T_BoolExpr:
-			{
-				BoolExpr *b = (BoolExpr *) expr;
-				ListCell *lc;
-
-				foreach(lc, b->args)
-				{
-					if (uplpgsql_classify_expr((Expr *) lfirst(lc)) != EXPR_TYPE_BOOL)
-						return EXPR_TYPE_UNKNOWN;
-				}
-				return EXPR_TYPE_BOOL;
-			}
+			/*
+			 * AND/OR/NOT are deliberately NOT Tier 1.
+			 *
+			 * They are the only non-strict operators here: NULL AND false is
+			 * false, NULL OR true is true, and NOT NULL is NULL.  Tier 1's
+			 * NULL handling (see tier1_expr_any_null) relies on every
+			 * operator being strict, so three-valued logic cannot ride along
+			 * with it.  Tier 2 implements 3VL explicitly.
+			 */
+			return EXPR_TYPE_UNKNOWN;
 
 		case T_SubscriptingRef:
 			{
@@ -2133,57 +2320,92 @@ uplpgsql_compile_expr_fmgr_full(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 		case T_BoolExpr:
 			{
 				/*
-				 * BoolExpr (AND/OR/NOT) — compile with native logic ops.
-				 * Each sub-arg is compiled via fmgr, truncated to i1.
+				 * BoolExpr (AND/OR/NOT) with SQL's three-valued logic.
+				 *
+				 * These are the only non-strict operators we compile, so the
+				 * result's nullness cannot be "null if any input is null":
+				 *
+				 *   NULL AND false = false     NULL OR true = true
+				 *   NULL AND true  = NULL      NULL OR false = NULL
+				 *   NOT NULL       = NULL
+				 *
+				 * AND is NULL when some input is NULL and none is definitely
+				 * false; OR is NULL when some input is NULL and none is
+				 * definitely true.  Both are computed branch-free: the value
+				 * is the ordinary bitwise fold (a NULL input contributes its
+				 * datum, which is 0 = false, and that is exactly what makes
+				 * "false wins" for AND and lets a true input win for OR).
 				 */
 				BoolExpr   *b = (BoolExpr *) expr;
 				ListCell   *lc;
 
 				if (b->boolop == NOT_EXPR)
 				{
-					LLVMValueRef arg = uplpgsql_compile_expr_fmgr(ctx,
-						(Expr *) linitial(b->args), estate_ref);
-					LLVMValueRef b1, notv;
+					LLVMValueRef arg, arg_isnull = NULL, b1, notv;
 
+					arg = uplpgsql_compile_expr_fmgr_full(ctx,
+						(Expr *) linitial(b->args), estate_ref, &arg_isnull);
 					if (arg == NULL)
 						return NULL;
+					/* NOT NULL is NULL: nullness passes straight through */
+					if (isnull_out)
+						*isnull_out = arg_isnull;
 					b1 = LLVMBuildTrunc(builder, arg, i1, "fmgr.not.in");
 					notv = LLVMBuildNot(builder, b1, "fmgr.not");
 					return LLVMBuildZExt(builder, notv, i64, "fmgr.not.datum");
 				}
-				else if (b->boolop == AND_EXPR)
+				else
 				{
-					LLVMValueRef result = LLVMConstInt(i1, 1, false);
+					bool			is_and = (b->boolop == AND_EXPR);
+					LLVMValueRef	result = LLVMConstInt(i1, is_and ? 1 : 0,
+														  false);
+					LLVMValueRef	any_null = LLVMConstInt(i1, 0, false);
+					LLVMValueRef	decided = LLVMConstInt(i1, 0, false);
 
 					foreach(lc, b->args)
 					{
-						LLVMValueRef arg = uplpgsql_compile_expr_fmgr(ctx,
-							(Expr *) lfirst(lc), estate_ref);
-						LLVMValueRef b1;
+						LLVMValueRef arg, arg_isnull = NULL, b1, known;
 
+						arg = uplpgsql_compile_expr_fmgr_full(ctx,
+							(Expr *) lfirst(lc), estate_ref, &arg_isnull);
 						if (arg == NULL)
 							return NULL;
-						b1 = LLVMBuildTrunc(builder, arg, i1, "fmgr.and.in");
-						result = LLVMBuildAnd(builder, result, b1, "fmgr.and");
-					}
-					return LLVMBuildZExt(builder, result, i64, "fmgr.and.datum");
-				}
-				else /* OR_EXPR */
-				{
-					LLVMValueRef result = LLVMConstInt(i1, 0, false);
 
-					foreach(lc, b->args)
-					{
-						LLVMValueRef arg = uplpgsql_compile_expr_fmgr(ctx,
-							(Expr *) lfirst(lc), estate_ref);
-						LLVMValueRef b1;
+						b1 = LLVMBuildTrunc(builder, arg, i1,
+											is_and ? "fmgr.and.in"
+												   : "fmgr.or.in");
+						result = is_and
+							? LLVMBuildAnd(builder, result, b1, "fmgr.and")
+							: LLVMBuildOr(builder, result, b1, "fmgr.or");
 
-						if (arg == NULL)
-							return NULL;
-						b1 = LLVMBuildTrunc(builder, arg, i1, "fmgr.or.in");
-						result = LLVMBuildOr(builder, result, b1, "fmgr.or");
+						any_null = LLVMBuildOr(builder, any_null, arg_isnull,
+											   "fmgr.bool.anynull");
+
+						/*
+						 * "decided": this input settles the result on its own
+						 * — a non-NULL false for AND, a non-NULL true for OR.
+						 */
+						known = LLVMBuildNot(builder, arg_isnull,
+											 "fmgr.bool.notnull");
+						if (is_and)
+							known = LLVMBuildAnd(builder, known,
+								LLVMBuildNot(builder, b1, "fmgr.bool.isfalse"),
+								"fmgr.bool.decides");
+						else
+							known = LLVMBuildAnd(builder, known, b1,
+												 "fmgr.bool.decides");
+						decided = LLVMBuildOr(builder, decided, known,
+											  "fmgr.bool.decided");
 					}
-					return LLVMBuildZExt(builder, result, i64, "fmgr.or.datum");
+
+					if (isnull_out)
+						*isnull_out = LLVMBuildAnd(builder, any_null,
+							LLVMBuildNot(builder, decided, "fmgr.bool.undec"),
+							"fmgr.bool.isnull");
+
+					return LLVMBuildZExt(builder, result, i64,
+										 is_and ? "fmgr.and.datum"
+												: "fmgr.or.datum");
 				}
 			}
 
@@ -2625,15 +2847,62 @@ uplpgsql_try_compile_assign(UPLpgSQL_compile_ctx *ctx,
 	expr_class = uplpgsql_classify_expr(expr);
 	if (expr_class != EXPR_TYPE_UNKNOWN && expr_class == target_class)
 	{
+		LLVMValueRef	any_null;
+
 		elog(DEBUG1, "uplpgsql: inlining %s assignment to dno %d: %s",
 			 (target_class == EXPR_TYPE_INT4 ? "int4" :
 			  target_class == EXPR_TYPE_INT8 ? "int8" : "float8"),
 			 stmt->varno, stmt->expr->query);
 
 		estate_ref = LLVMGetParam(ctx->function, 0);
-		result = uplpgsql_compile_expr_datum(ctx, expr, estate_ref, &expr_class);
-		datum_val = native_to_datum(ctx, result, expr_class);
-		uplpgsql_emit_store_var_datum(ctx, estate_ref, stmt->varno, datum_val);
+		any_null = tier1_expr_any_null(ctx, expr, estate_ref);
+
+		if (any_null == NULL)
+		{
+			/* Nothing nullable in it — compute unconditionally. */
+			result = uplpgsql_compile_expr_datum(ctx, expr, estate_ref,
+												 &expr_class);
+			datum_val = native_to_datum(ctx, result, expr_class);
+			uplpgsql_emit_store_var_datum(ctx, estate_ref, stmt->varno,
+										  datum_val);
+			return true;
+		}
+
+		/*
+		 * Some leaf may be NULL, and every Tier 1 operator is strict, so the
+		 * result is then NULL.  Branch rather than compute-and-discard: the
+		 * arithmetic can raise (division by zero, overflow) on whatever
+		 * garbage a NULL variable's datum happens to hold, and PostgreSQL
+		 * would have returned NULL without ever invoking the operator.
+		 */
+		{
+			LLVMBasicBlockRef	compute_bb, null_bb, merge_bb;
+
+			compute_bb = LLVMAppendBasicBlockInContext(ctx->context,
+													   ctx->function,
+													   "t1.notnull");
+			null_bb = LLVMAppendBasicBlockInContext(ctx->context,
+													ctx->function, "t1.null");
+			merge_bb = LLVMAppendBasicBlockInContext(ctx->context,
+													 ctx->function,
+													 "t1.done");
+
+			LLVMBuildCondBr(ctx->builder, any_null, null_bb, compute_bb);
+
+			LLVMPositionBuilderAtEnd(ctx->builder, compute_bb);
+			result = uplpgsql_compile_expr_datum(ctx, expr, estate_ref,
+												 &expr_class);
+			datum_val = native_to_datum(ctx, result, expr_class);
+			uplpgsql_emit_store_var_datum(ctx, estate_ref, stmt->varno,
+										  datum_val);
+			LLVMBuildBr(ctx->builder, merge_bb);
+
+			LLVMPositionBuilderAtEnd(ctx->builder, null_bb);
+			uplpgsql_emit_store_var_null(ctx, estate_ref, stmt->varno);
+			LLVMBuildBr(ctx->builder, merge_bb);
+
+			LLVMPositionBuilderAtEnd(ctx->builder, merge_bb);
+		}
 		return true;
 	}
 
@@ -2651,13 +2920,24 @@ uplpgsql_try_compile_assign(UPLpgSQL_compile_ctx *ctx,
 
 		if (target_var->datatype->typbyval)
 		{
-			datum_val = uplpgsql_compile_expr_fmgr(ctx, expr, estate_ref);
+			LLVMValueRef	isnull_val;
+
+			/*
+			 * Take the isnull the expression computed, rather than assuming
+			 * not-null: a strict function with a NULL argument is skipped and
+			 * yields NULL, and 3VL boolean operators produce NULL of their
+			 * own accord.  Storing with isnull hardwired to false turned
+			 * those into 0/false.
+			 */
+			datum_val = uplpgsql_compile_expr_fmgr_full(ctx, expr, estate_ref,
+														&isnull_val);
 			if (datum_val != NULL)
 			{
 				elog(DEBUG1, "uplpgsql: fmgr bypass assignment to dno %d: %s",
 					 stmt->varno, stmt->expr->query);
-				uplpgsql_emit_store_var_datum(ctx, estate_ref, stmt->varno,
-											  datum_val);
+				uplpgsql_emit_store_var_datum_isnull(ctx, estate_ref,
+													 stmt->varno, datum_val,
+													 isnull_val);
 				return true;
 			}
 			/* Fall through to Tier 3 */
@@ -3403,28 +3683,95 @@ uplpgsql_try_compile_bool(UPLpgSQL_compile_ctx *ctx,
 	tc = uplpgsql_classify_expr(expr);
 	if (tc == EXPR_TYPE_BOOL)
 	{
+		LLVMValueRef	any_null, val;
+
 		elog(DEBUG1, "uplpgsql: inlining bool expression: %s", expr_node->query);
 
 		estate_ref = LLVMGetParam(ctx->function, 0);
-		*result_out = uplpgsql_compile_expr_bool(ctx, expr, estate_ref);
+		any_null = tier1_expr_any_null(ctx, expr, estate_ref);
+
+		if (any_null == NULL)
+		{
+			*result_out = uplpgsql_compile_expr_bool(ctx, expr, estate_ref);
+			return true;
+		}
+
+		/*
+		 * A NULL operand makes the condition NULL, and callers (IF, WHILE,
+		 * EXIT WHEN) treat NULL as not-true, so the result is false.  As in
+		 * the assignment path, branch around the comparison rather than
+		 * computing it on a NULL variable's datum.
+		 */
+		{
+			LLVMBasicBlockRef	compute_bb, null_bb, merge_bb, from_bb;
+			LLVMValueRef		phi;
+			LLVMValueRef		vals[2];
+			LLVMBasicBlockRef	blocks[2];
+
+			compute_bb = LLVMAppendBasicBlockInContext(ctx->context,
+													   ctx->function,
+													   "t1b.notnull");
+			null_bb = LLVMAppendBasicBlockInContext(ctx->context,
+													ctx->function, "t1b.null");
+			merge_bb = LLVMAppendBasicBlockInContext(ctx->context,
+													 ctx->function,
+													 "t1b.done");
+
+			LLVMBuildCondBr(ctx->builder, any_null, null_bb, compute_bb);
+
+			LLVMPositionBuilderAtEnd(ctx->builder, compute_bb);
+			val = uplpgsql_compile_expr_bool(ctx, expr, estate_ref);
+			/* the comparison may have added blocks; branch from the current one */
+			from_bb = LLVMGetInsertBlock(ctx->builder);
+			LLVMBuildBr(ctx->builder, merge_bb);
+
+			LLVMPositionBuilderAtEnd(ctx->builder, null_bb);
+			LLVMBuildBr(ctx->builder, merge_bb);
+
+			LLVMPositionBuilderAtEnd(ctx->builder, merge_bb);
+			phi = LLVMBuildPhi(ctx->builder, ctx->types[UPLPGSQL_INT1],
+							   "t1b.result");
+			vals[0] = val;
+			blocks[0] = from_bb;
+			vals[1] = LLVMConstInt(ctx->types[UPLPGSQL_INT1], 0, false);
+			blocks[1] = null_bb;
+			LLVMAddIncoming(phi, vals, blocks, 2);
+
+			*result_out = phi;
+		}
 		return true;
 	}
 
 	/* Tier 2: fmgr bypass — result is Datum, truncate to i1 */
 	if (uplpgsql_can_fmgr_compile(expr))
 	{
-		LLVMValueRef datum_result;
+		LLVMValueRef	datum_result;
+		LLVMValueRef	isnull_val = NULL;
 
 		elog(DEBUG1, "uplpgsql: fmgr bypass bool expression: %s",
 			 expr_node->query);
 
 		estate_ref = LLVMGetParam(ctx->function, 0);
-		datum_result = uplpgsql_compile_expr_fmgr(ctx, expr, estate_ref);
+		datum_result = uplpgsql_compile_expr_fmgr_full(ctx, expr, estate_ref,
+													   &isnull_val);
 		if (datum_result != NULL)
 		{
-			*result_out = LLVMBuildTrunc(ctx->builder, datum_result,
-										 ctx->types[UPLPGSQL_INT1],
-										 "fmgr.bool.result");
+			LLVMValueRef	val;
+
+			val = LLVMBuildTrunc(ctx->builder, datum_result,
+								 ctx->types[UPLPGSQL_INT1],
+								 "fmgr.bool.result");
+
+			/*
+			 * IF/WHILE/EXIT WHEN treat a NULL condition as not-true, so fold
+			 * nullness in rather than dropping it: NOT NULL evaluates to a
+			 * true datum with isnull set, and without this it would take the
+			 * THEN branch.
+			 */
+			*result_out = LLVMBuildAnd(ctx->builder, val,
+									   LLVMBuildNot(ctx->builder, isnull_val,
+													"fmgr.bool.notnull"),
+									   "fmgr.bool.cond");
 			return true;
 		}
 		/* Fall through to Tier 3 */

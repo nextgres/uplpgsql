@@ -15,7 +15,7 @@ DATA = uplpgsql--1.0.sql
 
 # Regression tests — sql/ and expected/ are in ../../test/plpgsql/
 REGRESS = plpgsql_array plpgsql_cache plpgsql_call plpgsql_control \
-	plpgsql_copy plpgsql_domain plpgsql_jit plpgsql_misc \
+	plpgsql_copy plpgsql_coverage plpgsql_domain plpgsql_jit plpgsql_misc \
 	plpgsql_record plpgsql_simple plpgsql_transaction \
 	plpgsql_trap plpgsql_trigger plpgsql_varprops
 REGRESS_OPTS = --load-extension=uplpgsql \

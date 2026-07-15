@@ -18,14 +18,8 @@ BEGIN
 END;
 $$;
 ERROR:  RETURN cannot have a parameter in a procedure
-LINE 3:     RETURN 5;
+LINE 5:     RETURN 5;
                    ^
-QUERY:  
-BEGIN
-    RETURN 5;
-END;
-
-CONTEXT:  compilation of PL/pgSQL function "test_proc2" near line 3
 CREATE TABLE test1 (a int);
 CREATE PROCEDURE test_proc3(x int)
 LANGUAGE uplpgsql
@@ -425,7 +419,6 @@ BEGIN
   c := array[a];
 END;
 $$;
-ERROR:  could not determine actual argument type for polymorphic function "test_proc12"
 DO LANGUAGE uplpgsql $$
 DECLARE _a int; _b int; _c int[];
 BEGIN
@@ -434,12 +427,8 @@ BEGIN
   RAISE NOTICE '_a: %, _b: %, _c: %', _a, _b, _c;
 END
 $$;
-ERROR:  procedure test_proc12(integer, integer, integer[]) does not exist
-LINE 1: CALL test_proc12(_a, _b, _c)
-             ^
-DETAIL:  There is no procedure of that name.
-QUERY:  CALL test_proc12(_a, _b, _c)
-CONTEXT:  PL/pgSQL function inline_code_block line 5 at CALL
+NOTICE:  a: 10
+NOTICE:  _a: 10, _b: 10, _c: {10}
 DO LANGUAGE uplpgsql $$
 DECLARE _a int; _b int; _c text[];
 BEGIN
@@ -451,7 +440,8 @@ $$;
 ERROR:  procedure test_proc12(integer, integer, text[]) does not exist
 LINE 1: CALL test_proc12(_a, _b, _c)
              ^
-DETAIL:  There is no procedure of that name.
+DETAIL:  No procedure of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 QUERY:  CALL test_proc12(_a, _b, _c)
 CONTEXT:  PL/pgSQL function inline_code_block line 5 at CALL
 -- transition variable assignment
