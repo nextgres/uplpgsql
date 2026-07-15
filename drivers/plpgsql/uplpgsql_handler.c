@@ -102,7 +102,7 @@ UPLpgSQL_plugin **uplpgsql_plugin_ptr = NULL;
  * dump_ir:              Dump the generated LLVM IR to the server log (debugging)
  */
 static bool uplpgsql_log_compilation = false;
-static bool uplpgsql_dump_ir = false;
+bool		uplpgsql_dump_ir = false;
 bool		uplpgsql_enable_jit_heuristic = false;
 
 /* Forward declarations for GUC hooks */
@@ -193,8 +193,6 @@ _PG_init(void)
 							   uplpgsql_extra_errors_assign_hook,
 							   NULL);
 
-	MarkGUCPrefixReserved("uplpgsql");
-
 	/* uplpgsql-specific GUCs */
 	DefineCustomBoolVariable("uplpgsql.log_compilation",
 							 "Log when functions are JIT compiled.",
@@ -220,6 +218,14 @@ _PG_init(void)
 							 false,
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);
+
+	/*
+	 * Reserve the prefix only after every uplpgsql.* GUC has been defined, so
+	 * that a value SET before the module is first loaded (which lands as a
+	 * placeholder) is claimed by the matching definition rather than being
+	 * discarded as an unrecognized parameter.
+	 */
+	MarkGUCPrefixReserved("uplpgsql");
 
 	/* Register transaction callbacks for cleanup */
 	RegisterXactCallback(uplpgsql_xact_cb, NULL);
@@ -399,17 +405,19 @@ uplpgsql_call_handler(PG_FUNCTION_ARGS)
 									func->cfunc.fn_tid,
 									func,
 									(UPL_func *) jitfunc);
-					elog(LOG, "uplpgsql: JIT compiled function %s (oid %u)",
-						 func->fn_signature, func->fn_oid);
+					if (uplpgsql_log_compilation)
+						elog(LOG, "uplpgsql: JIT compiled function %s (oid %u)",
+							 func->fn_signature, func->fn_oid);
 				}
 				PG_CATCH();
 				{
 					EmitErrorReport();
 					FlushErrorState();
 					jitfunc = NULL;
-					elog(LOG, "uplpgsql: JIT compilation failed for %s, "
-						 "using interpreter",
-						 func->fn_signature);
+					if (uplpgsql_log_compilation)
+						elog(LOG, "uplpgsql: JIT compilation failed for %s, "
+							 "using interpreter",
+							 func->fn_signature);
 				}
 				PG_END_TRY();
 			}
@@ -421,8 +429,9 @@ uplpgsql_call_handler(PG_FUNCTION_ARGS)
 									 func->cfunc.fn_tid,
 									 func);
 				jitfunc = NULL;
-				elog(LOG, "uplpgsql: skipping JIT for %s (heuristic)",
-					 func->fn_signature);
+				if (uplpgsql_log_compilation)
+					elog(LOG, "uplpgsql: skipping JIT for %s (heuristic)",
+						 func->fn_signature);
 			}
 		}
 		else if (cache_status == UPL_CACHE_SKIP)

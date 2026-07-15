@@ -922,6 +922,15 @@ upl_compile_function(UPL_compile_ctx *ctx, UPL_compile_hooks *hooks)
 		/* 14. Verify the module */
 		upl_verify_module(ctx->module);
 
+		/* 14a. Optionally dump the generated IR (uplpgsql.dump_ir). */
+		if (hooks->dump_ir)
+		{
+			char *ir = LLVMPrintModuleToString(ctx->module);
+
+			elog(LOG, "upl: IR for %s:\n%s", func_name, ir);
+			LLVMDisposeMessage(ir);
+		}
+
 		/* 15. Optimize */
 		upl_optimize_module(ctx->module, 3);
 

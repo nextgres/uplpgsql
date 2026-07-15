@@ -353,6 +353,9 @@ typedef struct UPL_compile_hooks
 
 	/* Default return code value (typically 0 = RC_OK) */
 	int32 default_rc;
+
+	/* When true, dump the generated LLVM IR to the log after verification */
+	bool dump_ir;
 } UPL_compile_hooks;
 
 /*
