@@ -70,6 +70,8 @@
  */
 #include "upl_common.h"
 
+#include <math.h>				/* INFINITY */
+
 /*
  * Convenience macros for accessing PL/pgSQL-specific lang_data fields.
  */
