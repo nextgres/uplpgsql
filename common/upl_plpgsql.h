@@ -41,6 +41,30 @@
 #include "utils/funccache.h"
 #include "utils/typcache.h"
 
+/*
+ * Compatibility shims for building against PostgreSQL majors older than the
+ * development tree this code was forked from.  Each name below arrived in
+ * PostgreSQL 19; on 18 and earlier an equivalent is provided here.  This
+ * header is included, directly or transitively, by every forked exec/comp
+ * source that uses them.
+ *
+ * Inert on 19 and later — the whole block compiles away.
+ */
+#if PG_VERSION_NUM < 190000
+/* No compact-attribute finalize step exists before the CompactAttribute work. */
+#define TupleDescFinalize(td)	((void) 0)
+/* Optimizer hint; a no-op is always correct. */
+#ifndef pg_assume
+#define pg_assume(expr)			((void) 0)
+#endif
+/* Intentional switch fall-through marker. */
+#ifndef pg_fallthrough
+#define pg_fallthrough			/* fall through */
+#endif
+/* Bare "varlena" alias; struct varlena itself has always existed. */
+typedef struct varlena varlena;
+#endif
+
 
 /**********************************************************************
  * Definitions

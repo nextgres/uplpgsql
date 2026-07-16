@@ -70,6 +70,8 @@
  */
 #include "upl_common.h"
 
+#include <math.h>				/* INFINITY */
+
 #include "utils/datum.h"		/* datumCopy */
 
 /*
