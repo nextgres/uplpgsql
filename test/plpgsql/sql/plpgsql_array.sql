@@ -986,3 +986,41 @@ drop function pa_write(int[]);
 drop function pa_round_trip(int[]);
 drop function pa_write_expr(int[], int);
 drop function pa_write_nullsub(int[]);
+
+-- Allocation scope for the native element write's value (PR #45).
+-- an allocating value expression in a native-array element write (numeric
+-- arithmetic allocates on every call) runs inside an allocation scope, so it
+-- neither leaks per iteration nor corrupts the stored element
+create function na_write_alloc_numeric() returns int language uplpgsql as $$
+declare a int[] := array_fill(0, ARRAY[3]); m numeric := 2.5;
+begin
+  for i in 1..3 loop a[i] := (m * 4.0)::int; end loop;
+  return a[1] + a[2] + a[3];
+end; $$;
+select na_write_alloc_numeric();
+
+-- a by-value element whose value came through a by-reference (text)
+-- intermediate: the intermediate is freed by the scope, the stored int is
+-- correct
+create function na_write_text_intermediate() returns int language uplpgsql as $$
+declare a int[] := array_fill(0, ARRAY[3]);
+begin
+  for i in 1..3 loop a[i] := length(upper('ab' || i::text)); end loop;
+  return a[1] + a[2] + a[3];
+end; $$;
+select na_write_text_intermediate();
+
+-- an allocating element write that also reads the array whole-datum:
+-- the scope is withheld (the marshalled Datum would be freed by its reset),
+-- and the result is still correct
+create function na_write_reads_self() returns int language uplpgsql as $$
+declare a int[] := ARRAY[10, 20, 30]; m numeric := 2.0;
+begin
+  for i in 1..3 loop a[i] := coalesce(array_length(a, 1), 0) + (m * i)::int; end loop;
+  return a[1] + a[2] + a[3];
+end; $$;
+select na_write_reads_self();
+
+drop function na_write_alloc_numeric();
+drop function na_write_text_intermediate();
+drop function na_write_reads_self();
