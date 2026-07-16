@@ -2641,6 +2641,88 @@ fmgr_expr_allocates(Expr *expr)
 }
 
 /*
+ * Does this fmgr-bypass expression read a native array as a whole Datum?
+ *
+ * A Param whose variable is a native array makes the compiled expression
+ * marshal the flat contents back into the variable's Datum slot at the point
+ * of use (see uplpgsql_emit_load_param_datum).  That marshal allocates the
+ * array in CurrentMemoryContext and stores the pointer in the variable, so
+ * it must not run inside an allocation scope: the scope's reset would free
+ * the value the variable now points at, and the next whole-datum use would
+ * free freed memory.  Callers use this to withhold the scope from such
+ * expressions — a leak is preferable to a dangling Datum, and a whole-datum
+ * array read inside a bypass tree is rare to begin with.
+ */
+static bool
+fmgr_expr_reads_native_array(UPLpgSQL_compile_ctx *ctx, Expr *expr)
+{
+	if (expr == NULL)
+		return false;
+
+	switch (nodeTag(expr))
+	{
+		case T_Param:
+			{
+				Param	   *p = (Param *) expr;
+
+				if (p->paramkind != PARAM_EXTERN)
+					return false;
+				return find_native_array(ctx, p->paramid - 1) != NULL;
+			}
+
+		case T_RelabelType:
+			return fmgr_expr_reads_native_array(ctx,
+												((RelabelType *) expr)->arg);
+
+		case T_OpExpr:
+			{
+				ListCell   *lc;
+
+				foreach(lc, ((OpExpr *) expr)->args)
+					if (fmgr_expr_reads_native_array(ctx, (Expr *) lfirst(lc)))
+						return true;
+				return false;
+			}
+
+		case T_FuncExpr:
+			{
+				ListCell   *lc;
+
+				foreach(lc, ((FuncExpr *) expr)->args)
+					if (fmgr_expr_reads_native_array(ctx, (Expr *) lfirst(lc)))
+						return true;
+				return false;
+			}
+
+		case T_BoolExpr:
+			{
+				ListCell   *lc;
+
+				foreach(lc, ((BoolExpr *) expr)->args)
+					if (fmgr_expr_reads_native_array(ctx, (Expr *) lfirst(lc)))
+						return true;
+				return false;
+			}
+
+		default:
+			return false;
+	}
+}
+
+/*
+ * Should this fmgr-bypass expression be bracketed in an allocation scope?
+ *
+ * Yes when it allocates, unless it also reads a native array whole-datum,
+ * whose marshalled Datum would land in the scope and be freed by its reset.
+ */
+static bool
+fmgr_expr_wants_alloc_scope(UPLpgSQL_compile_ctx *ctx, Expr *expr)
+{
+	return fmgr_expr_allocates(expr) &&
+		!fmgr_expr_reads_native_array(ctx, expr);
+}
+
+/*
  * Emit IR to load a variable's Datum value for use as a function argument.
  * Returns the Datum as i64.
  */
@@ -3542,7 +3624,7 @@ uplpgsql_try_compile_assign(UPLpgSQL_compile_ctx *ctx,
 		if (target_var->datatype->typbyval)
 		{
 			LLVMValueRef	isnull_val;
-			bool			scoped = fmgr_expr_allocates(expr);
+			bool			scoped = fmgr_expr_wants_alloc_scope(ctx, expr);
 			LLVMValueRef	old = NULL;
 
 			/*
@@ -3615,7 +3697,7 @@ uplpgsql_try_compile_assign(UPLpgSQL_compile_ctx *ctx,
 			 * own slot, and resetting the scope would free that live value.
 			 */
 			LLVMValueRef	isnull_val;
-			bool			scoped = fmgr_expr_allocates(expr);
+			bool			scoped = fmgr_expr_wants_alloc_scope(ctx, expr);
 			LLVMValueRef	old = NULL;
 
 			if (scoped)
@@ -4087,6 +4169,8 @@ not_native_init:
 					LLVMValueRef	val_isnull = NULL;
 					LLVMValueRef	data, len, idx0, gep;
 					LLVMValueRef	lb, in_range;
+					LLVMValueRef	scope_old = NULL;
+					bool			scoped = false;
 					LLVMBasicBlockRef fast_bb, slow_bb, done_bb;
 					LLVMTypeRef		i32_ty = ctx->types[UPLPGSQL_INT32];
 
@@ -4139,15 +4223,62 @@ not_native_init:
 						idx_val = uplpgsql_compile_expr_datum(ctx, idx_expr,
 															  estate_ref,
 															  &idx_class);
+
+						/*
+						 * An allocating value expression — "(n * 1.5)::int"
+						 * with a numeric n allocates numeric_mul's result on
+						 * every call — must run inside an allocation scope or
+						 * it leaks per iteration, exactly as the scalar
+						 * assignment path would.  The scope can close as soon
+						 * as the Datum is flattened to the element's native
+						 * type: elemtype_to_class() only admits by-value
+						 * element types, so after datum_to_native() the value
+						 * is a register, not a pointer into the scope, and
+						 * both the flat store and the array_set_element slow
+						 * path below run safely outside it.
+						 */
+						scoped = fmgr_expr_wants_alloc_scope(ctx, val_expr);
+						if (scoped)
+						{
+							LLVMValueRef a[] = { estate_ref };
+
+							scope_old = LLVMBuildCall2(ctx->builder,
+								ctx->rt_fntypes[RT_ALLOC_SCOPE_ENTER],
+								ctx->rt_funcs[RT_ALLOC_SCOPE_ENTER],
+								a, 1, "scope.old");
+						}
+
 						val_result = uplpgsql_compile_expr_fmgr_full(ctx,
 																	 val_expr,
 																	 estate_ref,
 																	 &val_isnull);
 						if (val_result == NULL)
+						{
+							/* fmgr_full bailed: restore the context first */
+							if (scoped)
+							{
+								LLVMValueRef a[] = { estate_ref, scope_old };
+
+								LLVMBuildCall2(ctx->builder,
+									ctx->rt_fntypes[RT_ALLOC_SCOPE_EXIT],
+									ctx->rt_funcs[RT_ALLOC_SCOPE_EXIT],
+									a, 2, "");
+							}
 							goto standard_array_path;
+						}
 
 						val_result = datum_to_native(ctx, val_result,
 													 val_class);
+
+						if (scoped)
+						{
+							LLVMValueRef a[] = { estate_ref, scope_old };
+
+							LLVMBuildCall2(ctx->builder,
+								ctx->rt_fntypes[RT_ALLOC_SCOPE_EXIT],
+								ctx->rt_funcs[RT_ALLOC_SCOPE_EXIT],
+								a, 2, "");
+						}
 					}
 					else
 						goto standard_array_path;
@@ -4633,7 +4764,7 @@ uplpgsql_try_compile_bool(UPLpgSQL_compile_ctx *ctx,
 	{
 		LLVMValueRef	datum_result;
 		LLVMValueRef	isnull_val = NULL;
-		bool			scoped = fmgr_expr_allocates(expr);
+		bool			scoped = fmgr_expr_wants_alloc_scope(ctx, expr);
 		LLVMValueRef	old = NULL;
 
 		elog(DEBUG1, "uplpgsql: fmgr bypass bool expression: %s",
