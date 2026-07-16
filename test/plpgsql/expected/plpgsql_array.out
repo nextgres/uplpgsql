@@ -882,3 +882,47 @@ drop function na_selective_sync();
 drop function na_selective_sync2();
 drop function na_selective_sync3();
 drop function na_selective_whole();
+--
+-- Selective marshal must not trust an expression that was never prepared.
+--
+-- The read-set comes from paramnos, which parse analysis fills in.  The JIT
+-- compiles before the function has ever executed, so a fallback ASSIGN whose
+-- expression was not prepared at compile time (a record-field target bails
+-- out before preparing; a prepare can also fail mid-analysis) has an empty
+-- or partial paramnos, and trusting it would bake a stale-array read into
+-- the compiled code.  Such statements must marshal every native array.
+--
+-- record-field target: the fallback's expression is never prepared
+create function na_sync_recfield() returns int language uplpgsql as $$
+declare a int[]; r record;
+begin
+  a := array_fill(0, ARRAY[3]);
+  select 0 as x into r;
+  a[1] := 42;                    -- native flat write; a's Datum is stale
+  r.x := a[1];                   -- fallback assign, unprepared expression
+  return r.x;
+end; $$;
+select na_sync_recfield();
+ na_sync_recfield 
+------------------
+               42
+(1 row)
+
+-- prepare fails mid-analysis on the record field, leaving paramnos partial
+create function na_sync_partial() returns int language uplpgsql as $$
+declare a int[]; r record; x int;
+begin
+  a := array_fill(0, ARRAY[3]);
+  select 5 as f into r;
+  a[1] := 42;                    -- native flat write; a's Datum is stale
+  x := r.f + a[1];               -- r.f cannot be analyzed at compile time
+  return x;
+end; $$;
+select na_sync_partial();
+ na_sync_partial 
+-----------------
+              47
+(1 row)
+
+drop function na_sync_recfield();
+drop function na_sync_partial();
