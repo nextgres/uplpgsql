@@ -1,5 +1,9 @@
 # uplpgsql
 
+<p align="center">
+  <img src="assets/hero.svg" alt="uplpgsql — PL/pgSQL, compiled to native machine code; 9–23× faster than the interpreter" width="100%">
+</p>
+
 A JIT-compiling PL/pgSQL for Postgres, derived from the NEXTGRES Universal Procedural Language (UPL) compiler and runtime.
 
 > [!WARNING]
