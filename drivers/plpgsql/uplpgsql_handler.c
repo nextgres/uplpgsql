@@ -450,19 +450,35 @@ uplpgsql_call_handler(PG_FUNCTION_ARGS)
 				}
 				PG_CATCH();
 				{
-					/* Report the failure, then roll the subtransaction back. */
+					ErrorData  *edata;
+
+					/*
+					 * Capture the compile error, then roll the subtransaction
+					 * back.  We must NOT EmitErrorReport() it: compilation
+					 * failing is not a query failure — execution continues
+					 * under the interpreter — so sending it to the client at
+					 * ERROR severity produces a spurious error alongside the
+					 * real result (and confuses the wire protocol).  Re-emit
+					 * the cause on the server log instead, folded into the
+					 * fallback notice: at LOG when uplpgsql.log_compilation is
+					 * on, at DEBUG1 otherwise.
+					 *
+					 * CopyErrorData() runs in oldcontext (which outlives the
+					 * subtransaction) before FlushErrorState clears the error.
+					 */
 					MemoryContextSwitchTo(oldcontext);
-					EmitErrorReport();
+					edata = CopyErrorData();
 					FlushErrorState();
 					RollbackAndReleaseCurrentSubTransaction();
 					MemoryContextSwitchTo(oldcontext);
 					CurrentResourceOwner = oldowner;
 
 					jitfunc = NULL;
-					if (uplpgsql_log_compilation)
-						elog(LOG, "uplpgsql: JIT compilation failed for %s, "
-							 "using interpreter",
-							 func->fn_signature);
+					elog(uplpgsql_log_compilation ? LOG : DEBUG1,
+						 "uplpgsql: JIT compilation failed for %s (%s), "
+						 "using interpreter",
+						 func->fn_signature, edata->message);
+					FreeErrorData(edata);
 				}
 				PG_END_TRY();
 			}
