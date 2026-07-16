@@ -1572,7 +1572,6 @@ uplpgsql_register_runtime_funcs(UPLpgSQL_compile_ctx *ctx)
 	LLVMTypeRef ptr = ctx->types[UPLPGSQL_PTR];
 	LLVMTypeRef i1  = ctx->types[UPLPGSQL_INT1];
 	LLVMTypeRef i8  = ctx->types[UPLPGSQL_INT8];
-	LLVMTypeRef i16 = ctx->types[UPLPGSQL_INT16];
 	LLVMTypeRef i32 = ctx->types[UPLPGSQL_INT32];
 	LLVMTypeRef i64 = ctx->types[UPLPGSQL_INT64];
 	LLVMTypeRef vd  = ctx->types[UPLPGSQL_VOID];
@@ -2047,10 +2046,10 @@ uplpgsql_register_runtime_funcs(UPLpgSQL_compile_ctx *ctx)
 
 	/*
 	 * Datum uplpgsql_rt_array_get_element(ptr estate, i32 dno, i32 subscript,
-	 *     i32 typlen, i16 elmlen, i1 elmbyval, i8 elmalign, ptr isNull)
+	 *     i32 typlen, i32 elmlen, i1 elmbyval, i8 elmalign, ptr isNull)
 	 */
 	{
-		LLVMTypeRef params[] = { ptr, i32, i32, i32, i16, i1, i8, ptr };
+		LLVMTypeRef params[] = { ptr, i32, i32, i32, i32, i1, i8, ptr };
 		LLVMTypeRef ft = LLVMFunctionType(i64, params, 8, false);
 
 		ctx->rt_fntypes[RT_ARRAY_GET_ELEMENT] = ft;
@@ -2061,10 +2060,10 @@ uplpgsql_register_runtime_funcs(UPLpgSQL_compile_ctx *ctx)
 	/*
 	 * void uplpgsql_rt_array_set_element(ptr estate, i32 dno, i32 subscript,
 	 *     i64 value, i1 isnull, i32 typlen, i32 elemtype,
-	 *     i16 elmlen, i1 elmbyval, i8 elmalign)
+	 *     i32 elmlen, i1 elmbyval, i8 elmalign)
 	 */
 	{
-		LLVMTypeRef params[] = { ptr, i32, i32, i64, i1, i32, i32, i16, i1, i8 };
+		LLVMTypeRef params[] = { ptr, i32, i32, i64, i1, i32, i32, i32, i1, i8 };
 		LLVMTypeRef ft = LLVMFunctionType(vd, params, 10, false);
 
 		ctx->rt_fntypes[RT_ARRAY_SET_ELEMENT] = ft;

@@ -848,38 +848,32 @@ begin
 end; $$;
 select na_nullsub_ok();
 
--- These read the standard (non-native) array element path.  Kept on int[]
--- rather than the PR's numeric[]: a non-native array whose element type is
--- pass-by-reference (numeric, text) crashes array_get_element on an
--- assert-enabled build regardless of NULL handling -- a separate, pre-existing
--- bug tracked on its own.  The isnull fix under test is identical for int[].
-
 -- a NULL subscript in a *read* is not an error: the element reads as NULL
-create function na_nullread_std(p int[]) returns text language uplpgsql as $$
-declare i int; x int;
+create function na_nullread_std(p numeric[]) returns text language uplpgsql as $$
+declare i int; x numeric;
 begin
   x := p[i];
   return coalesce(x::text, 'NULL');
 end; $$;
-select na_nullread_std(array[10,20]);
+select na_nullread_std(array[1.5,2.5]);
 
 -- and an out-of-range read reports NULL through isNull_out; storing the
 -- datum with isnull hardwired false turned it into 0
-create function na_nullread_oob(p int[]) returns text language uplpgsql as $$
-declare x int;
+create function na_nullread_oob(p numeric[]) returns text language uplpgsql as $$
+declare x numeric;
 begin
   x := p[9];
   return coalesce(x::text, 'NULL');
 end; $$;
-select na_nullread_oob(array[10,20]);
+select na_nullread_oob(array[1.5,2.5]);
 
-create function na_nullread_ok(p int[]) returns text language uplpgsql as $$
-declare x int;
+create function na_nullread_ok(p numeric[]) returns text language uplpgsql as $$
+declare x numeric;
 begin
   x := p[2];
   return coalesce(x::text, 'NULL');
 end; $$;
-select na_nullread_ok(array[10,20]);
+select na_nullread_ok(array[1.5,2.5]);
 
 drop function na_nullsub_var();
 drop function na_nullsub_oob();
@@ -1117,3 +1111,41 @@ drop function na_grow_lb();
 drop function na_grow_i8f8();
 drop function na_grow_nulls_track();
 drop function na_grow_gaps();
+
+--
+-- Non-native arrays with a pass-by-reference element type (numeric, text).
+--
+-- The element read/write helpers passed elmlen as a 16-bit argument; a varlena
+-- element type has elmlen = -1, which arrived at the runtime helper
+-- zero-extended (65535) and made array_get_element reject it.  These exercise
+-- the fixed path: reads (in range, NULL element, out of range, NULL subscript)
+-- and a NULL write, on numeric[] and text[] parameter arrays.
+--
+create function va_num_read(p numeric[], k int) returns text language uplpgsql as $$
+declare x numeric; begin x := p[k]; return coalesce(x::text, 'NULL'); end; $$;
+select va_num_read(array[1.5,2.5], 1);
+select va_num_read(array[1.5,NULL,2.5], 2);
+select va_num_read(array[1.5,2.5], 9);
+
+create function va_num_nullsub(p numeric[]) returns text language uplpgsql as $$
+declare i int; x numeric; begin x := p[i]; return coalesce(x::text, 'NULL'); end; $$;
+select va_num_nullsub(array[1.5,2.5]);
+
+create function va_num_write(p numeric[]) returns text language uplpgsql as $$
+declare b numeric; begin p[2] := b; return p::text; end; $$;
+select va_num_write(array[1.5,2.5,3.5]);
+
+create function va_txt_read(p text[], k int) returns text language uplpgsql as $$
+declare x text; begin x := p[k]; return coalesce(x, 'NULL'); end; $$;
+select va_txt_read(array['a','b'], 2);
+select va_txt_read(array['a','b'], 9);
+
+create function va_txt_write(p text[]) returns text language uplpgsql as $$
+declare b text; begin p[1] := b; return p::text; end; $$;
+select va_txt_write(array['a','b']);
+
+drop function va_num_read(numeric[], int);
+drop function va_num_nullsub(numeric[]);
+drop function va_num_write(numeric[]);
+drop function va_txt_read(text[], int);
+drop function va_txt_write(text[]);

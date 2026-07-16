@@ -479,14 +479,14 @@ extern void uplpgsql_emit_refresh_native_array(UPLpgSQL_compile_ctx *ctx,
 /* Runtime helpers for array element access from inlined expressions */
 extern Datum uplpgsql_rt_array_get_element(UPLpgSQL_exec_state *estate,
 										   int array_dno, int subscript,
-										   int typlen, int16 elmlen,
+										   int typlen, int elmlen,
 										   bool elmbyval, char elmalign,
 										   bool *isNull_out);
 extern void uplpgsql_rt_array_set_element(UPLpgSQL_exec_state *estate,
 										  int array_dno, int subscript,
 										  Datum newvalue, bool valisnull,
 										  int typlen, Oid elemtype,
-										  int16 elmlen, bool elmbyval,
+										  int elmlen, bool elmbyval,
 										  char elmalign);
 
 /* Runtime helpers for inlined overflow/division errors */

@@ -229,7 +229,14 @@ resolve_array_type_info(UPLpgSQL_compile_ctx *ctx, int array_dno,
 									arrayvar->datatype->typlen, true);
 	info->elemtype_val = LLVMConstInt(ctx->types[UPLPGSQL_INT32],
 									  elemtype, false);
-	info->elmlen_val = LLVMConstInt(ctx->types[UPLPGSQL_INT16],
+	/*
+	 * Emit elmlen as i32, not i16.  A varlena element type has elmlen == -1,
+	 * and a negative i16 argument passed to the runtime helper without a
+	 * sign-extension attribute arrives zero-extended (65535), which
+	 * array_get_element rejects.  Widening to a full int sidesteps the ABI
+	 * ambiguity; fixed-length elements are unaffected either way.
+	 */
+	info->elmlen_val = LLVMConstInt(ctx->types[UPLPGSQL_INT32],
 									elmlen, true);
 	info->elmbyval_val = LLVMConstInt(ctx->types[UPLPGSQL_INT1],
 									  elmbyval ? 1 : 0, false);

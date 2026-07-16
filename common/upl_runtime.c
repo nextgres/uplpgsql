@@ -875,7 +875,7 @@ uplpgsql_rt_exec_foreach_a(UPLpgSQL_exec_state *estate,
 UPLPGSQL_RT_EXPORT Datum
 uplpgsql_rt_array_get_element(UPLpgSQL_exec_state *estate,
 							  int array_dno, int subscript,
-							  int typlen, int16 elmlen,
+							  int typlen, int elmlen,
 							  bool elmbyval, char elmalign,
 							  bool *isNull_out)
 {
@@ -930,7 +930,7 @@ uplpgsql_rt_array_set_element(UPLpgSQL_exec_state *estate,
 							  int array_dno, int subscript,
 							  Datum newvalue, bool valisnull,
 							  int typlen, Oid elemtype,
-							  int16 elmlen, bool elmbyval,
+							  int elmlen, bool elmbyval,
 							  char elmalign)
 {
 	UPLpgSQL_execstate *plstate = estate->uplpgsql_estate;
