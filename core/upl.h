@@ -105,8 +105,41 @@ typedef struct UPL_loop_info
 	bool				is_loop;
 	LLVMBasicBlockRef	continue_bb;
 	LLVMBasicBlockRef	exit_bb;
+
+	/*
+	 * ctx->exc_frame_depth at the time this entry was pushed.  An
+	 * EXIT/CONTINUE targeting this entry from inside a more deeply nested
+	 * exception block must unwind every frame above this depth before it
+	 * branches; see upl_emit_loop_exit().
+	 */
+	int					exc_depth;
+
 	struct UPL_loop_info *next;
 } UPL_loop_info;
+
+/*
+ * Exception frame tracking for EXIT/CONTINUE — singly-linked stack.
+ *
+ * A block with exception handlers allocates a runtime frame (subtransaction,
+ * saved PG_exception_stack, stmt_mcontext) that its own exit paths release.
+ * An EXIT/CONTINUE whose target lies *outside* the block cannot use those
+ * paths: it branches straight to the target loop's block, so the compiler
+ * must emit the release call for every frame it jumps across — innermost
+ * first — or the subtransaction stays open and PG_exception_stack keeps
+ * pointing at a dead frame.
+ *
+ * The driver pushes an entry while compiling a try body (unwind_rt_fn =
+ * the try-exit helper, which commits the subtransaction) or a handler body
+ * (unwind_rt_fn = the handler-done helper, which pops the stmt_mcontext and
+ * restores cur_error), and pops it afterwards.  upl_emit_loop_exit() walks
+ * the stack down to the target's recorded depth.
+ */
+typedef struct UPL_exc_frame
+{
+	LLVMValueRef		frame_ptr;		/* runtime frame pointer (from push) */
+	int					unwind_rt_fn;	/* rt_funcs[] index of release helper */
+	struct UPL_exc_frame *next;
+} UPL_exc_frame;
 
 /* Forward declaration for callbacks that reference the context */
 typedef struct UPL_compile_ctx UPL_compile_ctx;
@@ -274,6 +307,10 @@ struct UPL_compile_ctx
 	/* Loop label tracking for EXIT/CONTINUE */
 	UPL_loop_info	   *loop_stack;
 
+	/* Enclosing exception frames an EXIT/CONTINUE may have to unwind */
+	UPL_exc_frame	   *exc_frame_stack;
+	int					exc_frame_depth;
+
 	/* Pre-registered LLVM types */
 	LLVMTypeRef			types[UPL_NUM_TYPES];
 
@@ -436,6 +473,11 @@ extern void upl_push_block_label(UPL_compile_ctx *ctx, const char *label,
 								 LLVMBasicBlockRef exit_bb);
 extern void upl_pop_loop(UPL_compile_ctx *ctx);
 extern UPL_loop_info *upl_find_loop(UPL_compile_ctx *ctx, const char *label);
+
+/* Exception frame stack management (for EXIT/CONTINUE unwinding) */
+extern void upl_push_exc_frame(UPL_compile_ctx *ctx, LLVMValueRef frame_ptr,
+							   int unwind_rt_fn);
+extern void upl_pop_exc_frame(UPL_compile_ctx *ctx);
 
 /*
  * Core IR primitives — language-agnostic control flow compilation.

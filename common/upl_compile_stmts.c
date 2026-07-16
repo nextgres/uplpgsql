@@ -534,6 +534,16 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 	ctx->return_bb = exception_return_bb;
 
 	/*
+	 * An EXIT/CONTINUE in the try body whose target lies outside this block
+	 * jumps across our frame, so upl_emit_loop_exit() must release it on the
+	 * way — via TRY_EXIT, since on that path the subtransaction commits.
+	 * Push the frame before the block's own label: the label's exit path
+	 * (try_exit_bb) releases the frame itself, so an "EXIT <label>" of this
+	 * very block must not unwind it a second time.
+	 */
+	upl_push_exc_frame(ctx, frame_ptr, RT_EXCEPTION_TRY_EXIT);
+
+	/*
 	 * "EXIT <label>" out of the try body must still release the
 	 * subtransaction, so it targets try_exit_bb rather than jumping straight
 	 * to after_block_bb.
@@ -545,6 +555,8 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 
 	if (stmt->label != NULL)
 		upl_pop_loop(ctx);
+
+	upl_pop_exc_frame(ctx);
 
 	ctx->return_bb = saved_return_bb;
 
@@ -592,6 +604,14 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 	 */
 	saved_return_bb = ctx->return_bb;
 	ctx->return_bb = handler_return_bb;
+
+	/*
+	 * Likewise for the handler bodies: an EXIT/CONTINUE that leaves the block
+	 * from inside a handler must run HANDLER_DONE for this frame on its way
+	 * out (the subtransaction was already rolled back in CATCH; what remains
+	 * is the stmt_mcontext pop, the cur_error restore, and the frame free).
+	 */
+	upl_push_exc_frame(ctx, frame_ptr, RT_EXCEPTION_HANDLER_DONE);
 
 	/* === HANDLER BLOCKS === */
 	i = 0;
@@ -643,6 +663,8 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 
 		i++;
 	}
+
+	upl_pop_exc_frame(ctx);
 
 	ctx->return_bb = saved_return_bb;
 

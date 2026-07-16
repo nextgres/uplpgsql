@@ -501,6 +501,190 @@ select exc_still_works_after_exit();
                           3
 (1 row)
 
+--
+-- EXIT/CONTINUE whose target lies *outside* an exception block.
+--
+-- These jumps cross the block's frame rather than leave through its own exit
+-- paths, so codegen has to release each crossed frame on the way out --
+-- commit the subtransaction from a try body, run handler cleanup from a
+-- handler.  Branching past that release left the subtransaction open and
+-- PG_exception_stack pointing at a dead frame: the next BEGIN warned "there
+-- is already a transaction in progress" and ROLLBACK took the backend down.
+--
+-- an unlabeled EXIT in a try body targets the enclosing loop; the insert
+-- must survive the crossed frame's subtransaction commit
+create function exit_loop_from_try() returns int language uplpgsql as $$
+declare r int := 0;
+begin
+  for i in 1..5 loop
+    begin
+      insert into exitblk_t values (i);
+      r := r + 1;
+      exit;
+    exception when others then r := 99;
+    end;
+  end loop;
+  return r + (select count(*)::int from exitblk_t);
+end; $$;
+truncate exitblk_t;
+select exit_loop_from_try();
+ exit_loop_from_try 
+--------------------
+                  2
+(1 row)
+
+-- conditional EXIT crossing a frame unwinds only when the branch is taken
+create function exit_when_cross_exc() returns int language uplpgsql as $$
+declare r int := 0;
+begin
+  for i in 1..5 loop
+    begin
+      insert into exitblk_t values (i);
+      exit when i = 3;
+      r := r + 1;
+    exception when others then r := 99;
+    end;
+  end loop;
+  return r * 10 + (select count(*)::int from exitblk_t);
+end; $$;
+truncate exitblk_t;
+select exit_when_cross_exc();
+ exit_when_cross_exc 
+---------------------
+                  23
+(1 row)
+
+-- EXIT of an outer block label from inside a nested exception block: the
+-- inner frame's subtransaction commits, the rest of the outer body is skipped
+create function exit_outer_cross_exc() returns int language uplpgsql as $$
+declare r int := 0;
+begin
+  <<b>> begin
+    begin
+      insert into exitblk_t values (1);
+      exit b;
+    exception when others then r := 99;
+    end;
+    r := 50;
+  end;
+  return r + (select count(*)::int from exitblk_t);
+end; $$;
+truncate exitblk_t;
+select exit_outer_cross_exc();
+ exit_outer_cross_exc 
+----------------------
+                    1
+(1 row)
+
+-- CONTINUE from inside a handler to the next iteration of the outer FOR,
+-- several times over; a trapped error afterwards proves the exception
+-- machinery is still intact
+create function continue_from_handler(n int) returns text language uplpgsql as $$
+declare r int := 0; caught int := 0;
+begin
+  for i in 1..n loop
+    begin
+      if i % 2 = 1 then
+        raise exception 'odd %', i;
+      end if;
+      r := r + i;
+    exception when others then
+      caught := caught + 1;
+      continue;
+    end;
+    r := r + 100;
+  end loop;
+  begin
+    perform 1 / 0;
+  exception when division_by_zero then r := r + 1000;
+  end;
+  return r::text || '/' || caught::text;
+end; $$;
+select continue_from_handler(6);
+ continue_from_handler 
+-----------------------
+ 1312/3
+(1 row)
+
+-- EXIT crossing TWO nested exception frames releases both, innermost first:
+-- both inserts commit
+create function exit_cross_two_frames() returns int language uplpgsql as $$
+declare r int := 0;
+begin
+  <<o>> begin
+    begin
+      insert into exitblk_t values (1);
+      begin
+        insert into exitblk_t values (2);
+        exit o;
+      exception when others then r := 90;
+      end;
+      r := 91;
+    exception when others then r := 92;
+    end;
+    r := 93;
+  end;
+  return r + (select count(*)::int from exitblk_t);
+end; $$;
+truncate exitblk_t;
+select exit_cross_two_frames();
+ exit_cross_two_frames 
+-----------------------
+                     2
+(1 row)
+
+-- EXIT from a handler that also crosses an enclosing try body: handler
+-- cleanup for the inner frame, subtransaction commit for the outer one
+create function exit_handler_cross_try() returns int language uplpgsql as $$
+declare r int := 0;
+begin
+  <<o>> begin
+    begin
+      insert into exitblk_t values (1);
+      begin
+        raise exception 'boom';
+      exception when others then
+        insert into exitblk_t values (2);
+        exit o;
+      end;
+    exception when others then r := 80;
+    end;
+  end;
+  return r + (select count(*)::int from exitblk_t);
+end; $$;
+truncate exitblk_t;
+select exit_handler_cross_try();
+ exit_handler_cross_try 
+------------------------
+                      2
+(1 row)
+
+-- the session's transaction state is sane after all of the above: an
+-- explicit transaction block opens and closes cleanly (a leaked
+-- subtransaction would warn on BEGIN and abort on ROLLBACK)
+begin;
+select 1 as sanity;
+ sanity 
+--------
+      1
+(1 row)
+
+rollback;
+-- and a trapped error still traps
+create function exc_still_works_after_crossing() returns int language uplpgsql as $$
+begin
+  begin
+    perform 1 / 0;
+  exception when division_by_zero then return 42;
+  end;
+  return 0;
+end; $$;
+select exc_still_works_after_crossing();
+ exc_still_works_after_crossing 
+--------------------------------
+                             42
+(1 row)
+
 drop function exit_block_resumes();
 drop function exit_block_nested_loop();
 drop function exit_block_when();
@@ -511,6 +695,13 @@ drop function exit_block_exc_subxact();
 drop function exit_handler_subxact();
 drop function exit_from_handler_body();
 drop function exc_still_works_after_exit();
+drop function exit_loop_from_try();
+drop function exit_when_cross_exc();
+drop function exit_outer_cross_exc();
+drop function continue_from_handler(int);
+drop function exit_cross_two_frames();
+drop function exit_handler_cross_try();
+drop function exc_still_works_after_crossing();
 drop table exitblk_t;
 -- verbose end block and end loop
 create function end_label1() returns void as $$
