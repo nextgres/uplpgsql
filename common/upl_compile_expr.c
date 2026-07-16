@@ -1355,6 +1355,15 @@ uplpgsql_rt_div_zero(void)
 			 errmsg("division by zero")));
 }
 
+/* Mirrors array_subscript_assign(); see emit_set_subscript_null_check(). */
+UPLPGSQL_RT_EXPORT void
+uplpgsql_rt_array_subscript_null(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+			 errmsg("array subscript in assignment must not be null")));
+}
+
 /*
  * Emit a call to a no-arg error runtime function, followed by unreachable.
  *
@@ -1373,6 +1382,48 @@ emit_error_call(UPLpgSQL_compile_ctx *ctx, const char *fn_name)
 
 	LLVMBuildCall2(ctx->builder, err_ft, err_fn, NULL, 0, "");
 	LLVMBuildUnreachable(ctx->builder);
+}
+
+/*
+ * Emit the NULL test for the subscript of an array element write, raising
+ * PostgreSQL's error on the NULL edge.
+ *
+ * A NULL subscript reads as NULL but *assigns* as an error — PostgreSQL's
+ * array_subscript_assign() raises "array subscript in assignment must not be
+ * null" — and the compiled write consumed it as a garbage index instead:
+ * whatever the NULL variable's datum happened to hold went straight into the
+ * range checks, so "a[i] := 99" with i NULL silently wrote a[0].
+ *
+ * The test must run BEFORE the subscript's value is computed.  When the
+ * subscript is itself a native array read — a[b[j]] := ... — that read's
+ * value path is a raw flat load with no bounds check of its own, on the
+ * invariant that tier1_expr_any_null() has been consulted and was false.
+ * This is that consultation for the subscript position: it folds "b[j] is
+ * out of range" (which PostgreSQL reads as NULL) into the same NULL edge,
+ * so the raw load runs only for an in-range, non-NULL subscript, and an
+ * out-of-range one raises here rather than fetching a garbage index from
+ * past the end of the flat buffer.
+ */
+static void
+emit_set_subscript_null_check(UPLpgSQL_compile_ctx *ctx, Expr *idx_expr,
+							  LLVMValueRef estate_ref)
+{
+	LLVMValueRef		idx_isnull;
+	LLVMBasicBlockRef	null_bb, ok_bb;
+
+	idx_isnull = tier1_expr_any_null(ctx, idx_expr, estate_ref);
+	if (idx_isnull == NULL)
+		return;					/* nothing in the subscript can be NULL */
+
+	null_bb = expr_append_block(ctx, "na.set.idxnull");
+	ok_bb = expr_append_block(ctx, "na.set.idxok");
+
+	LLVMBuildCondBr(ctx->builder, idx_isnull, null_bb, ok_bb);
+
+	LLVMPositionBuilderAtEnd(ctx->builder, null_bb);
+	emit_error_call(ctx, "uplpgsql_rt_array_subscript_null");
+
+	LLVMPositionBuilderAtEnd(ctx->builder, ok_bb);
 }
 
 
@@ -4097,6 +4148,8 @@ not_native_init:
 						elog(DEBUG1, "uplpgsql: native array set dno %d[idx]: %s",
 							 array_dno, stmt->expr->query);
 
+						emit_set_subscript_null_check(ctx, idx_expr,
+													  estate_ref);
 						idx_val = uplpgsql_compile_expr_datum(ctx, idx_expr,
 															  estate_ref,
 															  &idx_class);
@@ -4136,6 +4189,8 @@ not_native_init:
 							 "(fmgr bypass value): %s",
 							 array_dno, stmt->expr->query);
 
+						emit_set_subscript_null_check(ctx, idx_expr,
+													  estate_ref);
 						idx_val = uplpgsql_compile_expr_datum(ctx, idx_expr,
 															  estate_ref,
 															  &idx_class);
@@ -4323,6 +4378,33 @@ not_native_init:
 					elog(DEBUG1, "uplpgsql: native array get dno %d[idx] -> dno %d: %s",
 						 array_dno, stmt->varno, stmt->expr->query);
 
+					null_bb = expr_append_block(ctx, "na.get.null");
+					get_done_bb = expr_append_block(ctx, "na.get.done");
+
+					/*
+					 * A NULL subscript reads as SQL NULL — and, as in the
+					 * write path, the test has to run before the subscript's
+					 * value is computed: a native array read used as the
+					 * subscript is a raw flat load that is only safe once
+					 * tier1_expr_any_null() has answered false for it (see
+					 * emit_set_subscript_null_check).
+					 */
+					{
+						LLVMValueRef idx_isnull;
+
+						idx_isnull = tier1_expr_any_null(ctx, idx_expr,
+														 estate_ref);
+						if (idx_isnull != NULL)
+						{
+							LLVMBasicBlockRef idxok_bb;
+
+							idxok_bb = expr_append_block(ctx, "na.get.idxok");
+							LLVMBuildCondBr(ctx->builder, idx_isnull,
+											null_bb, idxok_bb);
+							LLVMPositionBuilderAtEnd(ctx->builder, idxok_bb);
+						}
+					}
+
 					idx_val = uplpgsql_compile_expr_datum(ctx, idx_expr,
 														  estate_ref,
 														  &idx_class);
@@ -4357,9 +4439,7 @@ not_native_init:
 								"na.above"),
 							"na.oob2");
 
-						null_bb = expr_append_block(ctx, "na.get.null");
 						val_bb = expr_append_block(ctx, "na.get.val");
-						get_done_bb = expr_append_block(ctx, "na.get.done");
 
 						LLVMBuildCondBr(ctx->builder, oob, null_bb, val_bb);
 
@@ -4407,11 +4487,45 @@ standard_array_path:
 					/*
 					 * Array element read: x := arr[i]
 					 */
-					LLVMValueRef idx_val, isnull_ptr, elem_datum;
+					LLVMValueRef idx_val, isnull_ptr, elem_datum, elem_isnull;
 					LLVMBasicBlockRef entry_bb;
+					LLVMBasicBlockRef null_bb = NULL;
+					LLVMBasicBlockRef done_bb = NULL;
 
 					elog(DEBUG1, "uplpgsql: array get dno %d[idx] -> dno %d: %s",
 						 array_dno, stmt->varno, stmt->expr->query);
+
+					/*
+					 * A NULL subscript reads as SQL NULL; consumed as a
+					 * garbage index it could just as well land in range and
+					 * fetch an arbitrary element.  The test runs before the
+					 * subscript's value for the same reason as in the writes
+					 * (see emit_set_subscript_null_check).
+					 */
+					{
+						LLVMValueRef idx_isnull;
+
+						idx_isnull = tier1_expr_any_null(ctx, idx_expr,
+														 estate_ref);
+						if (idx_isnull != NULL)
+						{
+							LLVMBasicBlockRef idxok_bb;
+
+							null_bb = expr_append_block(ctx, "arr.get.null");
+							done_bb = expr_append_block(ctx, "arr.get.done");
+							idxok_bb = expr_append_block(ctx, "arr.get.idxok");
+
+							LLVMBuildCondBr(ctx->builder, idx_isnull,
+											null_bb, idxok_bb);
+
+							LLVMPositionBuilderAtEnd(ctx->builder, null_bb);
+							uplpgsql_emit_store_var_null(ctx, estate_ref,
+														 stmt->varno);
+							LLVMBuildBr(ctx->builder, done_bb);
+
+							LLVMPositionBuilderAtEnd(ctx->builder, idxok_bb);
+						}
+					}
 
 					idx_val = uplpgsql_compile_expr_datum(ctx, idx_expr,
 														  estate_ref,
@@ -4452,8 +4566,25 @@ standard_array_path:
 						}
 					}
 
-					uplpgsql_emit_store_var_datum(ctx, estate_ref,
-												  stmt->varno, elem_datum);
+					/*
+					 * The element itself may be NULL — an out-of-range read,
+					 * or a NULL element — and array_get_element reports that
+					 * through isNull_out.  Storing the datum with isnull
+					 * hardwired false turned those into 0.
+					 */
+					elem_isnull = LLVMBuildLoad2(ctx->builder,
+												 ctx->types[UPLPGSQL_INT1],
+												 isnull_ptr, "arr_elem_isnull");
+					uplpgsql_emit_store_var_datum_isnull(ctx, estate_ref,
+														 stmt->varno,
+														 elem_datum,
+														 elem_isnull);
+
+					if (done_bb != NULL)
+					{
+						LLVMBuildBr(ctx->builder, done_bb);
+						LLVMPositionBuilderAtEnd(ctx->builder, done_bb);
+					}
 					return true;
 				}
 				else
@@ -4476,6 +4607,8 @@ standard_array_path:
 						elog(DEBUG1, "uplpgsql: array set dno %d[idx] := val: %s",
 							 array_dno, stmt->expr->query);
 
+						emit_set_subscript_null_check(ctx, idx_expr,
+													  estate_ref);
 						idx_val = uplpgsql_compile_expr_datum(ctx, idx_expr,
 															  estate_ref,
 															  &idx_class);

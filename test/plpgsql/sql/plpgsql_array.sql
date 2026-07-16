@@ -683,3 +683,97 @@ drop function na_selective_sync();
 drop function na_selective_sync2();
 drop function na_selective_sync3();
 drop function na_selective_whole();
+
+-- a NULL subscript in an element assignment raises; it must not be consumed
+-- as a garbage index (it silently wrote a[0])
+create function na_nullsub_var() returns int[] language uplpgsql as $$
+declare a int[] := array[1,2,3]; i int;
+begin
+  a[i] := 99;
+  return a;
+end; $$;
+select na_nullsub_var();
+
+-- the subscript may itself be a native array read: out of range it reads as
+-- NULL, and the assignment must then raise rather than fetch a garbage index
+-- from past the end of the flat buffer
+create function na_nullsub_oob() returns int[] language uplpgsql as $$
+declare a int[] := array[1,2,3]; b int[] := array[2,7];
+begin
+  a[b[9]] := 99;
+  return a;
+end; $$;
+select na_nullsub_oob();
+
+-- same with an in-range subscript element that is NULL
+create function na_nullsub_elem() returns int[] language uplpgsql as $$
+declare a int[] := array[1,2,3]; b int[] := array[2,null];
+begin
+  a[b[2]] := 99;
+  return a;
+end; $$;
+select na_nullsub_elem();
+
+-- the fmgr-bypass value arm takes the same subscript check
+create function na_nullsub_fmgr() returns int[] language uplpgsql as $$
+declare a int[] := array[1,2,3]; i int;
+begin
+  a[i] := floor(1.5)::int;
+  return a;
+end; $$;
+select na_nullsub_fmgr();
+
+-- the standard (non-native) write path: an array parameter is never native
+create function na_nullsub_std(a int[]) returns int[] language uplpgsql as $$
+declare i int;
+begin
+  a[i] := 5;
+  return a;
+end; $$;
+select na_nullsub_std(array[1,2,3]);
+
+-- an in-range variable subscript still works
+create function na_nullsub_ok() returns int[] language uplpgsql as $$
+declare a int[] := array[1,2,3]; i int := 2;
+begin
+  a[i] := 99;
+  return a;
+end; $$;
+select na_nullsub_ok();
+
+-- a NULL subscript in a *read* is not an error: the element reads as NULL
+create function na_nullread_std(p numeric[]) returns text language uplpgsql as $$
+declare i int; x numeric;
+begin
+  x := p[i];
+  return coalesce(x::text, 'NULL');
+end; $$;
+select na_nullread_std(array[1.5,2.5]);
+
+-- and an out-of-range read reports NULL through isNull_out; storing the
+-- datum with isnull hardwired false turned it into 0
+create function na_nullread_oob(p numeric[]) returns text language uplpgsql as $$
+declare x numeric;
+begin
+  x := p[9];
+  return coalesce(x::text, 'NULL');
+end; $$;
+select na_nullread_oob(array[1.5,2.5]);
+
+create function na_nullread_ok(p numeric[]) returns text language uplpgsql as $$
+declare x numeric;
+begin
+  x := p[2];
+  return coalesce(x::text, 'NULL');
+end; $$;
+select na_nullread_ok(array[1.5,2.5]);
+
+drop function na_nullsub_var();
+drop function na_nullsub_oob();
+drop function na_nullsub_elem();
+drop function na_nullsub_fmgr();
+drop function na_nullsub_std(int[]);
+drop function na_nullsub_ok();
+drop function na_nullread_std(numeric[]);
+drop function na_nullread_oob(numeric[]);
+drop function na_nullread_ok(numeric[]);

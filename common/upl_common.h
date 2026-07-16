@@ -479,6 +479,7 @@ extern void uplpgsql_rt_array_set_element(UPLpgSQL_exec_state *estate,
 /* Runtime helpers for inlined overflow/division errors */
 extern void uplpgsql_rt_int_overflow(void);
 extern void uplpgsql_rt_div_zero(void);
+extern void uplpgsql_rt_array_subscript_null(void);
 
 /* --- Native local array runtime helpers (Phase 7) --- */
 /* Heap alloc for arrays > NATIVE_ARRAY_STACK_THRESHOLD bytes */
