@@ -28,7 +28,8 @@ compilation. The minimum `Execution Time` over five runs is reported.
 
 - PostgreSQL 20devel, LLVM 22.1.7
 - Apple M2 Max, macOS/arm64
-- uplpgsql at `a4cec41`
+- uplpgsql on `main`, including the constant-fold, eval-scope, and
+  FunctionCallInfo-hoist fixes
 
 Ratios are the point of comparison; absolute times are machine-specific.
 
@@ -36,22 +37,22 @@ Ratios are the point of comparison; absolute times are machine-specific.
 
 | Workload | Interpreter (ms) | uplpgsql JIT (ms) | Ratio |
 |----------|-----------------:|------------------:|------:|
-| float8 arithmetic          |  769.8 |  35.4 | 21.8x |
-| nested loop (Mandelbrot)   |  118.3 |   5.8 | 20.4x |
-| array element reads        |  340.0 |  20.8 | 16.4x |
-| int4 arithmetic            | 1393.6 |  95.9 | 14.5x |
-| branch and nested loop     | 3376.6 | 338.8 | 10.0x |
-| int8 arithmetic            |  755.4 |  92.7 |  8.1x |
-| numeric arithmetic         |  493.9 | 386.1 |  1.3x |
-| array element writes       |   24.6 |   6.7 |  3.7x |
-| Cornell box path tracer    | 43953.9 | 3010.7 | 14.6x |
+| nested loop (Mandelbrot)   |  119.5 |   5.2 | 23.0x |
+| float8 arithmetic          |  783.8 |  36.1 | 21.7x |
+| array element reads        |  349.4 |  21.1 | 16.6x |
+| Cornell box path tracer    | 43953.9 | 2887.9 | 15.2x |
+| int4 arithmetic            | 1408.3 |  95.8 | 14.7x |
+| branch and nested loop     | 3429.7 | 263.1 | 13.0x |
+| int8 arithmetic            |  767.7 |  84.9 |  9.0x |
+| array element writes       |   25.6 |   5.1 |  5.0x |
+| numeric arithmetic         |  502.9 | 355.8 |  1.4x |
 
 All workloads returned identical values under both engines.
 
 ## Reading the table
 
-**Scalar arithmetic, branches and loops compile to native code**, and run 8x to
-22x faster. This is what the JIT is for.
+**Scalar arithmetic, branches and loops compile to native code**, and run 9x to
+23x faster. This is what the JIT is for.
 
 **numeric has no native path.** It is included because it is easy to write a
 benchmark that believes it is measuring float8 and is not: in PostgreSQL an
@@ -71,25 +72,24 @@ the value expression, not the store.** Separating the two halves:
 | | interpreter | uplpgsql | ratio |
 |---|---:|---:|---:|
 | `t[i] := i` — Tier 1 value, native store | 20.0 ms | 2.0 ms | 10.3x |
-| `floor(power(v,0.45)*255.0+0.5)::int` — no array at all | 10.9 ms | 6.6 ms | 1.6x |
+| `floor(power(v,0.45)*255.0+0.5)::int` — no array at all | 10.6 ms | 4.3 ms | 2.5x |
 
 The native store is fine. The value expression is where the gap is: it is a
 tree of Tier 2 calls (`power`, `floor`, the cast), and Tier 2 does not compile
-as tightly as Tier 1's native arithmetic. It still beats the interpreter here,
-but only 1.6x against 10x for the store, so the mixed workload lands in
-between.
+as tightly as Tier 1's native arithmetic. It still beats the interpreter, but
+2.5x against 10x for the store, so the mixed workload lands in between.
 
-Two Tier 2 costs account for the gap. First, `float8` casts of numeric
-literals inside the expression were being emitted as per-call
-`float8(numeric)` conversions — measured at 0.3x, slower than the interpreter,
-and leaking memory besides — until they were folded to constants at compile
-time; that is what moved this row from 0.8x to 3.7x. Second, what remains: the
-`FunctionCallInfo` is allocated once in the entry block, but it is zeroed and
-its `flinfo`/`context`/`resultinfo`/`fncollation`/`nargs` fields are rewritten
-on every call, all loop-invariant. PostgreSQL's own interpreter initialises
-its `FunctionCallInfo` once when the `ExprState` is built and writes only the
-arguments per call. Hoisting that initialisation is an open optimisation that
-would narrow the remaining Tier 2 gap.
+Two Tier 2 costs, both since closed, had held this row down. First, `float8`
+casts of numeric literals were emitted as per-call `float8(numeric)`
+conversions — measured at 0.3x, slower than the interpreter, and leaking memory
+besides — until they were folded to constants at compile time. Second, the
+`FunctionCallInfo` was allocated once but zeroed and re-stamped with its
+loop-invariant `flinfo`/`nargs`/`fncollation` on every call; that setup now
+happens once per function invocation in the entry block, leaving only the
+argument stores and the isnull reset per call — the same shape PostgreSQL's own
+interpreter uses. Together those moved this row from 0.8x to 5.0x. What remains
+is the irreducible cost of a real function call per operator, which is why a
+call-dominated expression still trails native Tier 1 arithmetic.
 
 **The Cornell box** (`cornell.sql`) is the closest thing here to real code:
 float8 throughout, a scene held in arrays read once per sphere per bounce,

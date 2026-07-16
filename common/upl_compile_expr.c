@@ -3016,10 +3016,28 @@ uplpgsql_compile_expr_fmgr_full(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 				 * loop body (e.g. WHILE loop in Mandelbrot computation).
 				 */
 				fci_size = OFF_FCI_ARGS + SIZE_NULLABLE_DATUM * nargs;
+
+				/*
+				 * Allocate the FunctionCallInfoBaseData and set everything
+				 * about it that does not change between calls -- the zero-fill,
+				 * flinfo, nargs, and collation -- once, in the entry block.
+				 *
+				 * All of this is loop-invariant: emitting it at the call site
+				 * re-ran a memset plus four stores on every iteration, for
+				 * fields the callee never changes.  Only the argument slots and
+				 * the isnull reset are genuinely per-call, and those stay
+				 * below.  The alloca must be in the entry block regardless, to
+				 * avoid unbounded stack growth in a loop; the init rides along.
+				 *
+				 * Initialising an fcinfo whose call is never reached (it sits
+				 * in a branch not taken) is harmless -- it only writes the
+				 * scratch slot.
+				 */
 				{
 					LLVMBasicBlockRef entry_bb;
 					LLVMValueRef	  first_instr;
 					LLVMBasicBlockRef saved_bb;
+					FmgrInfo		 *persistent_finfo;
 
 					saved_bb = LLVMGetInsertBlock(builder);
 					entry_bb = LLVMGetEntryBasicBlock(ctx->function);
@@ -3033,24 +3051,17 @@ uplpgsql_compile_expr_fmgr_full(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 						LLVMConstInt(i32, fci_size, false), "fci.alloca");
 					LLVMSetAlignment(fci_alloca, 8);
 
-					LLVMPositionBuilderAtEnd(builder, saved_bb);
-				}
-
-				/* Zero the struct */
-				LLVMBuildMemSet(builder, fci_alloca,
-					LLVMConstInt(i8, 0, false),
-					LLVMConstInt(i64, fci_size, false), 8);
-
-				/*
-				 * Set flinfo to point to a persistent FmgrInfo.  Some
-				 * built-in functions dereference fcinfo->flinfo for fn_oid,
-				 * fn_collation, etc.  Allocate in TopMemoryContext so it
-				 * lives as long as the JIT'd code.
-				 */
-				{
-					FmgrInfo   *persistent_finfo;
+					/* Zero the struct */
+					LLVMBuildMemSet(builder, fci_alloca,
+						LLVMConstInt(i8, 0, false),
+						LLVMConstInt(i64, fci_size, false), 8);
 
 					/*
+					 * Set flinfo to point to a persistent FmgrInfo.  Some
+					 * built-in functions dereference fcinfo->flinfo for fn_oid,
+					 * fn_collation, etc.  Allocate in TopMemoryContext so it
+					 * lives as long as the JIT'd code.
+					 *
 					 * The compiled code holds a raw pointer to this FmgrInfo
 					 * for as long as it exists, so it must outlive any
 					 * compilation context — hence TopMemoryContext, and hence
@@ -3083,27 +3094,29 @@ uplpgsql_compile_expr_fmgr_full(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 						LLVMBuildBitCast(builder, gep,
 							LLVMPointerType(ptr, 0),
 							"fci.flinfo.typed"));
-				}
 
-				/* Set nargs */
-				off = LLVMConstInt(i64, OFF_FCI_NARGS, false);
-				gep = LLVMBuildGEP2(builder, i8, fci_alloca, &off, 1,
-									"fci.nargs.ptr");
-				LLVMBuildStore(builder,
-					LLVMConstInt(i16, nargs, false),
-					LLVMBuildBitCast(builder, gep,
-						LLVMPointerType(i16, 0), "fci.nargs.typed"));
-
-				/* Set collation */
-				if (collation != InvalidOid)
-				{
-					off = LLVMConstInt(i64, OFF_FCI_COLLATION, false);
+					/* Set nargs */
+					off = LLVMConstInt(i64, OFF_FCI_NARGS, false);
 					gep = LLVMBuildGEP2(builder, i8, fci_alloca, &off, 1,
-										"fci.collation.ptr");
+										"fci.nargs.ptr");
 					LLVMBuildStore(builder,
-						LLVMConstInt(i32, collation, false),
+						LLVMConstInt(i16, nargs, false),
 						LLVMBuildBitCast(builder, gep,
-							LLVMPointerType(i32, 0), "fci.collation.typed"));
+							LLVMPointerType(i16, 0), "fci.nargs.typed"));
+
+					/* Set collation */
+					if (collation != InvalidOid)
+					{
+						off = LLVMConstInt(i64, OFF_FCI_COLLATION, false);
+						gep = LLVMBuildGEP2(builder, i8, fci_alloca, &off, 1,
+											"fci.collation.ptr");
+						LLVMBuildStore(builder,
+							LLVMConstInt(i32, collation, false),
+							LLVMBuildBitCast(builder, gep,
+								LLVMPointerType(i32, 0), "fci.collation.typed"));
+					}
+
+					LLVMPositionBuilderAtEnd(builder, saved_bb);
 				}
 
 				/* Fill in argument values and isnull flags */
