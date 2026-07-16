@@ -90,6 +90,7 @@ upl_push_loop(UPL_compile_ctx *ctx, const char *label,
 	info->is_loop = true;
 	info->continue_bb = continue_bb;
 	info->exit_bb = exit_bb;
+	info->cleanup_depth = ctx->cleanup_depth;
 	info->next = ctx->loop_stack;
 	ctx->loop_stack = info;
 }
@@ -112,6 +113,7 @@ upl_push_block_label(UPL_compile_ctx *ctx, const char *label,
 	info->is_loop = false;
 	info->continue_bb = NULL;
 	info->exit_bb = exit_bb;
+	info->cleanup_depth = ctx->cleanup_depth;
 	info->next = ctx->loop_stack;
 	ctx->loop_stack = info;
 }
@@ -155,6 +157,84 @@ upl_find_loop(UPL_compile_ctx *ctx, const char *label)
 	}
 
 	return NULL;
+}
+
+
+/* ----------------------------------------------------------------
+ *		Cleanup stack management
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * Push an enclosing cleanup onto the tracking stack.
+ *
+ * The driver calls this before compiling statements that can jump across a
+ * held resource, passing the rt_funcs[] index of the helper that releases it
+ * on that path (try-exit for a try body, handler-done for a handler body,
+ * portal-close for a row loop) and the helper's operands after estate_ref
+ * (the frame or portal pointer).  An EXIT/CONTINUE compiled while the entry
+ * is on the stack and targeting a loop or block outside it will emit that
+ * call before branching.
+ */
+void
+upl_push_cleanup(UPL_compile_ctx *ctx, int unwind_rt_fn,
+				 LLVMValueRef *args, int nargs)
+{
+	UPL_cleanup_info *cleanup = palloc(sizeof(UPL_cleanup_info));
+	int			i;
+
+	Assert(nargs >= 0 && nargs <= UPL_CLEANUP_MAX_ARGS);
+
+	cleanup->unwind_rt_fn = unwind_rt_fn;
+	cleanup->nargs = nargs;
+	for (i = 0; i < nargs; i++)
+		cleanup->args[i] = args[i];
+	cleanup->next = ctx->cleanup_stack;
+	ctx->cleanup_stack = cleanup;
+	ctx->cleanup_depth++;
+}
+
+/*
+ * Pop the top cleanup from the tracking stack.
+ */
+void
+upl_pop_cleanup(UPL_compile_ctx *ctx)
+{
+	UPL_cleanup_info *top = ctx->cleanup_stack;
+
+	Assert(top != NULL);
+	ctx->cleanup_stack = top->next;
+	ctx->cleanup_depth--;
+	pfree(top);
+}
+
+/*
+ * Emit the release calls for every cleanup between the current position and
+ * target_depth, innermost first.
+ *
+ * Innermost first matters: a release commits its own subtransaction, pops
+ * its own stmt_mcontext, or closes its own portal, and those must come off
+ * in the reverse of the order they were entered, exactly as the constructs'
+ * own exit paths would have run had control left them one at a time.
+ */
+static void
+upl_emit_cleanup_unwind(UPL_compile_ctx *ctx, int target_depth)
+{
+	UPL_cleanup_info   *cleanup = ctx->cleanup_stack;
+	int					depth;
+
+	for (depth = ctx->cleanup_depth; depth > target_depth; depth--)
+	{
+		LLVMValueRef	args[1 + UPL_CLEANUP_MAX_ARGS];
+		int				i;
+
+		args[0] = ctx->estate_ref;
+		for (i = 0; i < cleanup->nargs; i++)
+			args[1 + i] = cleanup->args[i];
+
+		upl_emit_rt_call(ctx, cleanup->unwind_rt_fn, args, 1 + cleanup->nargs);
+		cleanup = cleanup->next;
+	}
 }
 
 
@@ -636,6 +716,27 @@ upl_emit_loop_exit(UPL_compile_ctx *ctx, const char *label,
 
 	target_bb = is_exit ? loop->exit_bb : loop->continue_bb;
 
+	/*
+	 * If the jump crosses one or more held resources — the statement sits
+	 * inside a BEGIN...EXCEPTION block or a FOR-over-rows loop (or several)
+	 * that the target loop or block encloses — the branch must not skip
+	 * their cleanup.  A crossed exception frame holds an open subtransaction
+	 * and has PG_exception_stack pointing at itself; branching past its
+	 * release leaves both in place, and the next BEGIN then reports "there
+	 * is already a transaction in progress" while a later error longjmps
+	 * into a block the function has left.  A crossed row loop holds a pinned
+	 * portal, and the surrounding transaction cannot commit until it is
+	 * closed ("cannot commit while a portal is pinned").
+	 *
+	 * Emit the release helper for every cleanup above the target's recorded
+	 * depth before taking the branch.  A target inside the same constructs
+	 * as the statement (loop->cleanup_depth == cleanup_depth) unwinds
+	 * nothing, and a construct's *own* entry needs nothing here either: an
+	 * exception block's label and a row loop's loop entry are pushed inside
+	 * their cleanup, and their exit_bb is the construct's cleanup path,
+	 * which releases the resource itself.
+	 */
+
 	if (cond_expr)
 	{
 		/* Conditional EXIT/CONTINUE */
@@ -646,7 +747,25 @@ upl_emit_loop_exit(UPL_compile_ctx *ctx, const char *label,
 
 		cond = upl_eval_bool(ctx, cond_expr);
 
-		LLVMBuildCondBr(ctx->builder, cond, target_bb, skip_bb);
+		if (loop->cleanup_depth < ctx->cleanup_depth)
+		{
+			/*
+			 * The cleanups must only run when the branch is taken, so the
+			 * release calls need a block of their own on the taken edge.
+			 */
+			LLVMBasicBlockRef unwind_bb;
+
+			unwind_bb = upl_append_block(ctx,
+										 is_exit ? "exit.unwind"
+												 : "continue.unwind");
+			LLVMBuildCondBr(ctx->builder, cond, unwind_bb, skip_bb);
+
+			LLVMPositionBuilderAtEnd(ctx->builder, unwind_bb);
+			upl_emit_cleanup_unwind(ctx, loop->cleanup_depth);
+			LLVMBuildBr(ctx->builder, target_bb);
+		}
+		else
+			LLVMBuildCondBr(ctx->builder, cond, target_bb, skip_bb);
 
 		/* Continue compilation after the skip */
 		LLVMPositionBuilderAtEnd(ctx->builder, skip_bb);
@@ -654,6 +773,7 @@ upl_emit_loop_exit(UPL_compile_ctx *ctx, const char *label,
 	else
 	{
 		/* Unconditional EXIT/CONTINUE */
+		upl_emit_cleanup_unwind(ctx, loop->cleanup_depth);
 		LLVMBuildBr(ctx->builder, target_bb);
 
 		/* Dead block for any statements after unconditional EXIT/CONTINUE */

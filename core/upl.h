@@ -105,8 +105,48 @@ typedef struct UPL_loop_info
 	bool				is_loop;
 	LLVMBasicBlockRef	continue_bb;
 	LLVMBasicBlockRef	exit_bb;
+
+	/*
+	 * ctx->cleanup_depth at the time this entry was pushed.  An EXIT/CONTINUE
+	 * targeting this entry from inside a more deeply nested exception block
+	 * or row loop must unwind every cleanup above this depth before it
+	 * branches; see upl_emit_loop_exit().
+	 */
+	int					cleanup_depth;
+
 	struct UPL_loop_info *next;
 } UPL_loop_info;
+
+/*
+ * Cleanup tracking for EXIT/CONTINUE — singly-linked stack.
+ *
+ * Some constructs hold a runtime resource that their own exit paths release:
+ * a block with exception handlers holds a frame (subtransaction, saved
+ * PG_exception_stack, stmt_mcontext), a FOR-over-rows loop holds an open
+ * portal.  An EXIT/CONTINUE whose target lies *outside* the construct cannot
+ * use those paths: it branches straight to the target's block, so the
+ * compiler must emit the release call for everything it jumps across —
+ * innermost first — or the subtransaction stays open (the next BEGIN warns,
+ * ROLLBACK aborts the backend) and the pinned portal makes the surrounding
+ * transaction unable to commit at all.
+ *
+ * The driver pushes an entry while compiling the statements that can jump
+ * across the resource — a try body (unwind_rt_fn = the try-exit helper,
+ * which commits the subtransaction), a handler body (the handler-done
+ * helper), a row-loop body (the portal-close helper) — and pops it
+ * afterwards.  args[] carries the helper's operands after estate_ref, e.g.
+ * the frame or portal pointer.  upl_emit_loop_exit() walks the stack down
+ * to the target's recorded depth.
+ */
+#define UPL_CLEANUP_MAX_ARGS	2
+
+typedef struct UPL_cleanup_info
+{
+	int					unwind_rt_fn;	/* rt_funcs[] index of release helper */
+	LLVMValueRef		args[UPL_CLEANUP_MAX_ARGS];	/* operands after estate */
+	int					nargs;			/* used entries in args[] */
+	struct UPL_cleanup_info *next;
+} UPL_cleanup_info;
 
 /* Forward declaration for callbacks that reference the context */
 typedef struct UPL_compile_ctx UPL_compile_ctx;
@@ -274,6 +314,10 @@ struct UPL_compile_ctx
 	/* Loop label tracking for EXIT/CONTINUE */
 	UPL_loop_info	   *loop_stack;
 
+	/* Enclosing cleanups an EXIT/CONTINUE may have to unwind */
+	UPL_cleanup_info   *cleanup_stack;
+	int					cleanup_depth;
+
 	/* Pre-registered LLVM types */
 	LLVMTypeRef			types[UPL_NUM_TYPES];
 
@@ -436,6 +480,11 @@ extern void upl_push_block_label(UPL_compile_ctx *ctx, const char *label,
 								 LLVMBasicBlockRef exit_bb);
 extern void upl_pop_loop(UPL_compile_ctx *ctx);
 extern UPL_loop_info *upl_find_loop(UPL_compile_ctx *ctx, const char *label);
+
+/* Cleanup stack management (for EXIT/CONTINUE unwinding) */
+extern void upl_push_cleanup(UPL_compile_ctx *ctx, int unwind_rt_fn,
+							 LLVMValueRef *args, int nargs);
+extern void upl_pop_cleanup(UPL_compile_ctx *ctx);
 
 /*
  * Core IR primitives — language-agnostic control flow compilation.

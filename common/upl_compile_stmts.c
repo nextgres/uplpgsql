@@ -534,6 +534,20 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 	ctx->return_bb = exception_return_bb;
 
 	/*
+	 * An EXIT/CONTINUE in the try body whose target lies outside this block
+	 * jumps across our frame, so upl_emit_loop_exit() must release it on the
+	 * way — via TRY_EXIT, since on that path the subtransaction commits.
+	 * Push the cleanup before the block's own label: the label's exit path
+	 * (try_exit_bb) releases the frame itself, so an "EXIT <label>" of this
+	 * very block must not unwind it a second time.
+	 */
+	{
+		LLVMValueRef cleanup_args[] = { frame_ptr };
+
+		upl_push_cleanup(ctx, RT_EXCEPTION_TRY_EXIT, cleanup_args, 1);
+	}
+
+	/*
 	 * "EXIT <label>" out of the try body must still release the
 	 * subtransaction, so it targets try_exit_bb rather than jumping straight
 	 * to after_block_bb.
@@ -545,6 +559,8 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 
 	if (stmt->label != NULL)
 		upl_pop_loop(ctx);
+
+	upl_pop_cleanup(ctx);
 
 	ctx->return_bb = saved_return_bb;
 
@@ -592,6 +608,18 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 	 */
 	saved_return_bb = ctx->return_bb;
 	ctx->return_bb = handler_return_bb;
+
+	/*
+	 * Likewise for the handler bodies: an EXIT/CONTINUE that leaves the block
+	 * from inside a handler must run HANDLER_DONE for this frame on its way
+	 * out (the subtransaction was already rolled back in CATCH; what remains
+	 * is the stmt_mcontext pop, the cur_error restore, and the frame free).
+	 */
+	{
+		LLVMValueRef cleanup_args[] = { frame_ptr };
+
+		upl_push_cleanup(ctx, RT_EXCEPTION_HANDLER_DONE, cleanup_args, 1);
+	}
 
 	/* === HANDLER BLOCKS === */
 	i = 0;
@@ -643,6 +671,8 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 
 		i++;
 	}
+
+	upl_pop_cleanup(ctx);
 
 	ctx->return_bb = saved_return_bb;
 
@@ -2980,6 +3010,19 @@ uplpgsql_compile_fors(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_fors *stmt)
 	saved_return_bb = ctx->return_bb;
 	ctx->return_bb = fors_return_bb;
 
+	/*
+	 * An EXIT/CONTINUE in the body whose target lies outside this loop jumps
+	 * across the open portal, so upl_emit_loop_exit() must close it on the
+	 * way — a pinned portal left behind makes the surrounding transaction
+	 * unable to commit.  Push the cleanup before the loop's own entry: EXIT
+	 * of this loop lands on exit_bb, which closes the portal itself.
+	 */
+	{
+		LLVMValueRef cleanup_args[] = { portal_val };
+
+		upl_push_cleanup(ctx, RT_CLOSE_PORTAL, cleanup_args, 1);
+	}
+
 	/* Push loop: CONTINUE → cond_bb, EXIT → exit_bb */
 	upl_push_loop(ctx, stmt->label, cond_bb, exit_bb);
 
@@ -3096,6 +3139,7 @@ uplpgsql_compile_fors(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_fors *stmt)
 	}
 
 	upl_pop_loop(ctx);
+	upl_pop_cleanup(ctx);
 
 	/* Restore real return block */
 	ctx->return_bb = saved_return_bb;
@@ -3220,6 +3264,17 @@ uplpgsql_compile_forc(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_forc *stmt)
 	saved_return_bb = ctx->return_bb;
 	ctx->return_bb = forc_return_bb;
 
+	/*
+	 * As in FORS: an EXIT/CONTINUE leaving this loop must close the cursor
+	 * on the way out.  The FORC close helper also takes the statement, to
+	 * unbind the cursor variable and free the prefetch context.
+	 */
+	{
+		LLVMValueRef cleanup_args[] = { stmt_ptr, portal_val };
+
+		upl_push_cleanup(ctx, RT_CLOSE_FORC_CURSOR, cleanup_args, 2);
+	}
+
 	/* Push loop: CONTINUE → cond_bb, EXIT → exit_bb */
 	upl_push_loop(ctx, stmt->label, cond_bb, exit_bb);
 
@@ -3227,6 +3282,7 @@ uplpgsql_compile_forc(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_forc *stmt)
 	uplpgsql_compile_stmts(ctx, stmt->body);
 
 	upl_pop_loop(ctx);
+	upl_pop_cleanup(ctx);
 
 	/* Restore real return block */
 	ctx->return_bb = saved_return_bb;
@@ -3359,9 +3415,17 @@ uplpgsql_compile_dynfors(UPLpgSQL_compile_ctx *ctx,
 	saved_return_bb = ctx->return_bb;
 	ctx->return_bb = dynfors_return_bb;
 
+	/* As in FORS: close the portal when a jump crosses this loop */
+	{
+		LLVMValueRef cleanup_args[] = { portal_val };
+
+		upl_push_cleanup(ctx, RT_CLOSE_PORTAL, cleanup_args, 1);
+	}
+
 	upl_push_loop(ctx, stmt->label, cond_bb, exit_bb);
 	uplpgsql_compile_stmts(ctx, stmt->body);
 	upl_pop_loop(ctx);
+	upl_pop_cleanup(ctx);
 
 	ctx->return_bb = saved_return_bb;
 
