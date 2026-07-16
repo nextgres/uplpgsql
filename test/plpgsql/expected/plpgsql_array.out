@@ -882,3 +882,144 @@ drop function na_selective_sync();
 drop function na_selective_sync2();
 drop function na_selective_sync3();
 drop function na_selective_whole();
+--
+-- NULL handling on non-native arrays.
+--
+-- Function-parameter arrays are never taken native (parameters may alias
+-- caller data), so their element reads and writes go through the
+-- array_get_element/array_set_element runtime helpers.  Those used to drop
+-- NULL in both directions: reads ignored the helper's isNull output, so a
+-- NULL element, an out-of-range subscript, and a NULL subscript all read as
+-- 0; writes passed a hardcoded valisnull = false, so a NULL value was
+-- stored as 0.  And a NULL subscript in an assignment must raise, as it
+-- does in PostgreSQL.
+--
+-- read of a NULL element must yield NULL, not 0
+create function pa_read(a int[]) returns int language uplpgsql as $$
+declare x int;
+begin
+  x := a[2];
+  return x;
+end; $$;
+select pa_read(ARRAY[1,NULL,3]) is null as read_null;
+ read_null 
+-----------
+ t
+(1 row)
+
+select pa_read(ARRAY[1,7,3]);
+ pa_read 
+---------
+       7
+(1 row)
+
+-- out-of-range read must yield NULL, not 0
+select pa_read(ARRAY[1]) is null as read_oob;
+ read_oob 
+----------
+ t
+(1 row)
+
+-- NULL subscript read must yield NULL
+create function pa_read_nullsub(a int[]) returns int language uplpgsql as $$
+declare i int; x int;
+begin
+  x := a[i];
+  return x;
+end; $$;
+select pa_read_nullsub(ARRAY[1,2,3]) is null as read_nullsub;
+ read_nullsub 
+--------------
+ t
+(1 row)
+
+-- a NULL element reaching Tier 1 arithmetic must make the result NULL
+create function pa_read_expr(a int[]) returns int language uplpgsql as $$
+declare x int;
+begin
+  x := a[2] + 1;
+  return x;
+end; $$;
+select pa_read_expr(ARRAY[1,NULL,3]) is null as expr_null;
+ expr_null 
+-----------
+ t
+(1 row)
+
+select pa_read_expr(ARRAY[1,7,3]);
+ pa_read_expr 
+--------------
+            8
+(1 row)
+
+-- write of a NULL value must store NULL, not 0
+create function pa_write(a int[]) returns int[] language uplpgsql as $$
+declare b int;
+begin
+  a[2] := b;
+  return a;
+end; $$;
+select pa_write(ARRAY[1,2,3]);
+  pa_write  
+------------
+ {1,NULL,3}
+(1 row)
+
+-- NULL written then read back, both through the JIT'd paths
+create function pa_round_trip(a int[]) returns int language uplpgsql as $$
+declare b int; x int;
+begin
+  a[2] := b;
+  x := a[2];
+  return x;
+end; $$;
+select pa_round_trip(ARRAY[1,2,3]) is null as round_trip_null;
+ round_trip_null 
+-----------------
+ t
+(1 row)
+
+-- a NULL value must not be computed: the arithmetic would raise on the
+-- garbage datum a NULL variable holds, where PostgreSQL stores a NULL
+create function pa_write_expr(a int[], d int) returns int[] language uplpgsql as $$
+begin
+  a[2] := 10 / d;
+  return a;
+end; $$;
+select pa_write_expr(ARRAY[1,2,3], NULL);
+ pa_write_expr 
+---------------
+ {1,NULL,3}
+(1 row)
+
+select pa_write_expr(ARRAY[1,2,3], 5);
+ pa_write_expr 
+---------------
+ {1,2,3}
+(1 row)
+
+-- a NULL subscript in an assignment is an error, as in PostgreSQL
+create function pa_write_nullsub(a int[]) returns text language uplpgsql as $$
+declare i int; msg text;
+begin
+  begin
+    a[i] := 5;
+    msg := 'not reached';
+  exception when null_value_not_allowed then
+    msg := 'caught: ' || sqlerrm;
+  end;
+  return msg;
+end; $$;
+select pa_write_nullsub(ARRAY[1,2,3]);
+                    pa_write_nullsub                    
+--------------------------------------------------------
+ caught: array subscript in assignment must not be null
+(1 row)
+
+drop function pa_read(int[]);
+drop function pa_read_nullsub(int[]);
+drop function pa_read_expr(int[]);
+drop function pa_write(int[]);
+drop function pa_round_trip(int[]);
+drop function pa_write_expr(int[], int);
+drop function pa_write_nullsub(int[]);
