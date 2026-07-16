@@ -1024,3 +1024,96 @@ select na_write_reads_self();
 drop function na_write_alloc_numeric();
 drop function na_write_text_intermediate();
 drop function na_write_reads_self();
+
+-- Linear native-array append growth (PR #38).
+
+-- growing an array one element at a time must be linear, not quadratic:
+-- every append used to round-trip the whole array through
+-- construct_md_array/array_set_element and leak the old mirror besides
+create function na_grow_loop(n int) returns text language uplpgsql as $$
+declare a int[]; i int;
+begin
+  for i in 1..n loop
+    a[i] := i;
+  end loop;
+  return a[1]::text || ' ' || a[n]::text || ' ' || array_length(a, 1)::text;
+end; $$;
+select na_grow_loop(20000);
+
+-- appends interleaved with gaps and refills keep PostgreSQL's semantics
+create function na_grow_mixed() returns text language uplpgsql as $$
+declare a int[];
+begin
+  a[1] := 10;                  -- append to a NULL array
+  a[2] := 20;                  -- plain append
+  a[5] := 50;                  -- gap: 3 and 4 become NULL
+  a[6] := 60;                  -- append right after the gap
+  a[3] := 30;                  -- fill part of the gap back in
+  return a::text || ' / ' || coalesce(a[4]::text, 'NULL');
+end; $$;
+select na_grow_mixed();
+
+-- appending to an array_fill'd array: the buffer may live on the stack and
+-- must be copied out, not repalloc'd, when it grows
+create function na_grow_after_fill() returns text language uplpgsql as $$
+declare a int[] := array_fill(7, ARRAY[2]);
+begin
+  a[3] := 9;
+  a[4] := 11;
+  return a::text;
+end; $$;
+select na_grow_after_fill();
+
+-- appending to an array with a non-1 lower bound
+create function na_grow_lb() returns text language uplpgsql as $$
+declare a int[] := '[2:3]={9,10}';
+begin
+  a[4] := 11;
+  return a::text;
+end; $$;
+select na_grow_lb();
+
+-- int8 and float8 elements take the same append path
+create function na_grow_i8f8() returns text language uplpgsql as $$
+declare b bigint[]; c float8[]; i int;
+begin
+  for i in 1..5000 loop
+    b[i] := i * 2;
+    c[i] := i / 2.0;
+  end loop;
+  return b[5000]::text || ' ' || c[5000]::text;
+end; $$;
+select na_grow_i8f8();
+
+-- the null-flag buffer must track the data capacity across appends
+create function na_grow_nulls_track() returns text language uplpgsql as $$
+declare a int[];
+begin
+  a[1] := 1;
+  a[4] := 4;                   -- gap write: null flags exist from here on
+  a[5] := 5;
+  a[6] := 6;
+  a[7] := 7;
+  return a::text;
+end; $$;
+select na_grow_nulls_track();
+
+-- a loop of gap writes exercises the refresh path repeatedly; each refresh
+-- must release the old mirror rather than leak it
+create function na_grow_gaps() returns text language uplpgsql as $$
+declare a int[]; i int;
+begin
+  for i in 1..200 loop
+    a[i * 3] := i;
+  end loop;
+  return array_length(a, 1)::text || ' ' || a[600]::text || ' ' || coalesce(a[599]::text, 'NULL');
+end; $$;
+select na_grow_gaps();
+
+drop function na_grow_loop(int);
+drop function na_grow_mixed();
+drop function na_grow_after_fill();
+drop function na_grow_lb();
+drop function na_grow_i8f8();
+drop function na_grow_nulls_track();
+drop function na_grow_gaps();

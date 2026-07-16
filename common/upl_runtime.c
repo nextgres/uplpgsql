@@ -1780,6 +1780,96 @@ uplpgsql_rt_native_array_to_datum(UPLpgSQL_exec_state *estate,
 }
 
 /*
+ * Grow a native array's flat buffers so that at least len + 1 elements fit.
+ *
+ * The cold half of the append fast path: the JIT'd code passes the addresses
+ * of its data/nulls/is_heap/cap slots and calls here only when len has
+ * reached the allocated capacity.  Capacity doubles, so a loop that fills an
+ * array one element at a time — the shape of every "a[i] := i" loop — pays
+ * amortized O(1) per write instead of a full sync/array_set_element/refresh
+ * round trip per element, which was quadratic in both time and memory.
+ *
+ * data may live on the stack (the small-array_fill buffer): that one cannot
+ * be repalloc'd or freed, only copied out to a fresh heap allocation, which
+ * is what is_heap distinguishes.  The nulls buffer, when present, is always
+ * heap-allocated and must track the data capacity, or a later append would
+ * write its flag past the end.
+ *
+ * PostgreSQL refuses to build an array of more than MaxAllocSize /
+ * sizeof(Datum) elements; enforce the same limit here so an append loop
+ * raises where array_set_element would have, rather than at some later sync.
+ */
+UPLPGSQL_RT_EXPORT void
+uplpgsql_rt_native_array_reserve(UPLpgSQL_exec_state *estate,
+								 void **data_io, bool **nulls_io,
+								 int8 *is_heap_io, int32 *cap_io,
+								 int32 len, int32 elem_size)
+{
+	MemoryContext	oldcxt;
+	int32			newcap;
+
+	if (*cap_io > len)
+		return;
+
+	if (len >= (int32) (MaxAllocSize / sizeof(Datum)))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("array size exceeds the maximum allowed (%d)",
+						(int) (MaxAllocSize / sizeof(Datum)))));
+
+	newcap = (*cap_io > 0) ? *cap_io * 2 : 8;
+	if (newcap <= len)
+		newcap = len + 1;
+	if (newcap > (int32) (MaxAllocSize / sizeof(Datum)))
+		newcap = (int32) (MaxAllocSize / sizeof(Datum));
+
+	oldcxt = MemoryContextSwitchTo(estate->uplpgsql_estate->datum_context);
+
+	if (*data_io != NULL && *is_heap_io)
+		*data_io = repalloc(*data_io, (Size) newcap * elem_size);
+	else
+	{
+		void	   *newdata = palloc((Size) newcap * elem_size);
+
+		if (len > 0 && *data_io != NULL)
+			memcpy(newdata, *data_io, (Size) len * elem_size);
+		*data_io = newdata;
+		*is_heap_io = 1;
+	}
+
+	if (*nulls_io != NULL)
+	{
+		*nulls_io = (bool *) repalloc(*nulls_io,
+									  (Size) newcap * sizeof(bool));
+		memset(*nulls_io + len, 0, (Size) (newcap - len) * sizeof(bool));
+	}
+
+	*cap_io = newcap;
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * Free a native array's previous flat buffers.
+ *
+ * Called by the refresh path just before from_datum() replaces the mirror:
+ * the old buffers have no other referent, and without this every refresh
+ * leaked the previous copy into datum_context — a loop of out-of-range
+ * writes accumulated O(n^2) bytes over the call, enough to OOM the backend
+ * on a 40,000-element growth loop.
+ *
+ * data is skipped when it is the array_fill stack buffer (is_heap 0); the
+ * nulls buffer is always heap-allocated when present.
+ */
+UPLPGSQL_RT_EXPORT void
+uplpgsql_rt_native_array_release(void *data, bool *nulls, int8 is_heap)
+{
+	if (data != NULL && is_heap)
+		pfree(data);
+	if (nulls != NULL)
+		pfree(nulls);
+}
+
+/*
  * Bounds check for native array subscript access.
  *
  * PL/pgSQL arrays are 1-based, so valid range is [1, length].

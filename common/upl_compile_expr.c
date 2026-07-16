@@ -4245,6 +4245,18 @@ uplpgsql_try_compile_assign(UPLpgSQL_compile_ctx *ctx,
 			LLVMBuildStore(ctx->builder, data_ptr, na->data_ptr);
 
 			/*
+			 * The buffer holds exactly n elements, and the same test that
+			 * chose stack vs heap says whether it may later be repalloc'd
+			 * by an append (see uplpgsql_rt_native_array_reserve).
+			 */
+			LLVMBuildStore(ctx->builder, n_val, na->cap_ptr);
+			LLVMBuildStore(ctx->builder,
+				LLVMBuildZExt(ctx->builder,
+					LLVMBuildNot(ctx->builder, use_stack, "na.onheap.i1"),
+					ctx->types[UPLPGSQL_INT8], "na.onheap"),
+				na->is_heap_ptr);
+
+			/*
 			 * Fill the array with the fill value.
 			 * Emit a simple loop: for (i = 0; i < n; i++) data[i] = val;
 			 */
@@ -4371,7 +4383,9 @@ not_native_init:
 					LLVMValueRef	lb, in_range;
 					LLVMValueRef	scope_old = NULL;
 					bool			scoped = false;
-					LLVMBasicBlockRef fast_bb, slow_bb, done_bb;
+					LLVMBasicBlockRef fast_bb, miss_bb, append_bb;
+					LLVMBasicBlockRef grow_bb, appstore_bb;
+					LLVMBasicBlockRef slow_bb, done_bb;
 					LLVMTypeRef		i32_ty = ctx->types[UPLPGSQL_INT32];
 
 					val_class = uplpgsql_classify_expr(val_expr);
@@ -4546,10 +4560,143 @@ not_native_init:
 							"na.set.ok.nn");
 
 					fast_bb = expr_append_block(ctx, "na.set.fast");
+					miss_bb = expr_append_block(ctx, "na.set.miss");
+					append_bb = expr_append_block(ctx, "na.set.append");
+					grow_bb = expr_append_block(ctx, "na.set.grow");
+					appstore_bb = expr_append_block(ctx, "na.set.appstore");
 					slow_bb = expr_append_block(ctx, "na.set.slow");
 					done_bb = expr_append_block(ctx, "na.set.done");
 
-					LLVMBuildCondBr(ctx->builder, in_range, fast_bb, slow_bb);
+					LLVMBuildCondBr(ctx->builder, in_range, fast_bb, miss_bb);
+
+					/*
+					 * Not a plain in-range store.  The overwhelmingly common
+					 * miss is the append — a write at exactly lb + len, the
+					 * shape of every "fill an array in a loop" function —
+					 * and PostgreSQL's semantics for it need no gap and no
+					 * NULL fill, just one more element.  Handle it natively:
+					 * ensure capacity (doubling, in the cold helper), store
+					 * into slot len, bump len.  Everything else — a real
+					 * gap, a 2-D value (len < 0), a NULL value — still goes
+					 * to array_set_element below.
+					 *
+					 * Before this every append took the slow path, a
+					 * sync/array_set_element/refresh round trip that copies
+					 * the whole array — with the refresh leaking the old
+					 * mirror besides — so growing an array element by
+					 * element was quadratic in time and memory: ~170x slower
+					 * than the interpreter at 20,000 elements, OOM at
+					 * 40,000.
+					 */
+					LLVMPositionBuilderAtEnd(ctx->builder, miss_bb);
+					{
+						LLVMValueRef	is_append;
+
+						is_append = LLVMBuildICmp(ctx->builder, LLVMIntSGE,
+												  len,
+												  LLVMConstInt(i32_ty, 0, true),
+												  "na.app.flat");
+						is_append = LLVMBuildAnd(ctx->builder, is_append,
+							LLVMBuildICmp(ctx->builder, LLVMIntEQ, idx_val,
+								LLVMBuildAdd(ctx->builder, lb, len,
+											 "na.app.next"),
+								"na.app.at.end"),
+							"na.append");
+						if (val_isnull != NULL)
+							is_append = LLVMBuildAnd(ctx->builder, is_append,
+								LLVMBuildNot(ctx->builder, val_isnull,
+											 "na.app.notnull"),
+								"na.append.nn");
+
+						LLVMBuildCondBr(ctx->builder, is_append, append_bb,
+										slow_bb);
+					}
+
+					/* Append: grow the buffers first when len has hit cap. */
+					LLVMPositionBuilderAtEnd(ctx->builder, append_bb);
+					{
+						LLVMValueRef	cap, need_grow;
+
+						cap = LLVMBuildLoad2(ctx->builder, i32_ty,
+											 na->cap_ptr, "na.cap");
+						need_grow = LLVMBuildICmp(ctx->builder, LLVMIntSGE,
+												  len, cap, "na.app.full");
+						LLVMBuildCondBr(ctx->builder, need_grow, grow_bb,
+										appstore_bb);
+					}
+
+					LLVMPositionBuilderAtEnd(ctx->builder, grow_bb);
+					{
+						LLVMValueRef args[] = {
+							estate_ref,
+							na->data_ptr,
+							na->nulls_ptr,
+							na->is_heap_ptr,
+							na->cap_ptr,
+							len,
+							LLVMConstInt(i32_ty, na->elem_size, false)
+						};
+
+						LLVMBuildCall2(ctx->builder,
+							ctx->rt_fntypes[RT_NATIVE_ARRAY_RESERVE],
+							ctx->rt_funcs[RT_NATIVE_ARRAY_RESERVE],
+							args, 7, "");
+					}
+					LLVMBuildBr(ctx->builder, appstore_bb);
+
+					/* Slot len is the append position (0-based). */
+					LLVMPositionBuilderAtEnd(ctx->builder, appstore_bb);
+					{
+						LLVMValueRef		adata, agep, anulls, ahas;
+						LLVMBasicBlockRef	aclr_bb, adone_bb;
+
+						adata = LLVMBuildLoad2(ctx->builder,
+											   ctx->types[UPLPGSQL_PTR],
+											   na->data_ptr, "na.app.data");
+						agep = LLVMBuildGEP2(ctx->builder, na->llvm_elemtype,
+											 adata, &len, 1, "na.app.slot");
+						LLVMBuildStore(ctx->builder, val_result, agep);
+
+						/*
+						 * The appended element has a value, so its NULL flag
+						 * (when flags exist at all) must be clear.  reserve
+						 * zeroes the grown tail, so this is only load-bearing
+						 * for a slot inside the old capacity — but it mirrors
+						 * the in-range store above and costs one byte.
+						 */
+						anulls = LLVMBuildLoad2(ctx->builder,
+												ctx->types[UPLPGSQL_PTR],
+												na->nulls_ptr, "na.app.nulls");
+						ahas = LLVMBuildICmp(ctx->builder, LLVMIntNE, anulls,
+											 LLVMConstNull(ctx->types[UPLPGSQL_PTR]),
+											 "na.app.has.nulls");
+
+						aclr_bb = expr_append_block(ctx, "na.app.clrnull");
+						adone_bb = expr_append_block(ctx, "na.app.stored");
+						LLVMBuildCondBr(ctx->builder, ahas, aclr_bb, adone_bb);
+
+						LLVMPositionBuilderAtEnd(ctx->builder, aclr_bb);
+						{
+							LLVMValueRef angep;
+
+							angep = LLVMBuildGEP2(ctx->builder,
+								ctx->types[UPLPGSQL_INT8], anulls, &len, 1,
+								"na.app.null.ptr");
+							LLVMBuildStore(ctx->builder,
+								LLVMConstInt(ctx->types[UPLPGSQL_INT8], 0,
+											 false),
+								angep);
+						}
+						LLVMBuildBr(ctx->builder, adone_bb);
+
+						LLVMPositionBuilderAtEnd(ctx->builder, adone_bb);
+						LLVMBuildStore(ctx->builder,
+							LLVMBuildAdd(ctx->builder, len,
+										 LLVMConstInt(i32_ty, 1, false),
+										 "na.app.newlen"),
+							na->len_ptr);
+					}
+					LLVMBuildBr(ctx->builder, done_bb);
 
 					/* In range: store straight into flat memory. */
 					LLVMPositionBuilderAtEnd(ctx->builder, fast_bb);
