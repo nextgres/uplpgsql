@@ -143,6 +143,8 @@ static void uplpgsql_analyze_native_arrays(UPLpgSQL_compile_ctx *ctx,
 
 /* Native array sync (defined later, needed by uplpgsql_call_exec) */
 static void uplpgsql_sync_native_arrays(UPLpgSQL_compile_ctx *ctx);
+static void uplpgsql_sync_native_arrays_for_expr(UPLpgSQL_compile_ctx *ctx,
+												 UPLpgSQL_expr *expr);
 
 /* Native array lookup (defined later, needed by uplpgsql_emit_init_vars) */
 static UPLpgSQL_native_array *uplpgsql_find_native_array(UPLpgSQL_compile_ctx *ctx,
@@ -219,22 +221,28 @@ uplpgsql_call_fn(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_rt_func which,
  * RAISE, FOREACH, EXECUTE, PERFORM, cursors, and the rest.  Syncing at this
  * one point covers them all; the alternative is remembering to do it in each
  * of the two dozen callers, which is how RAISE/FOREACH/EXECUTE were missed.
- * Callees that read no variables pay a wasted marshal, which is acceptable:
- * they are interpreter round-trips already, and the sync is a no-op unless
- * the function actually has native arrays.
+ * So this stays the default: correct for any callee, including ones whose
+ * variable reads are not visible here.
+ *
+ * The wasted marshal it costs a callee that reads no arrays is not always
+ * acceptable, though.  It is proportional to the size of every native array
+ * in the function, and it is paid every time the statement runs, so a single
+ * uncompilable expression in a hot loop -- "p := greatest(a,b,c)", which is
+ * a MinMaxExpr and reaches neither tier -- marshals megabytes per iteration
+ * for arrays it never touches.  Where the statement's expression is known,
+ * uplpgsql_call_exec_nosync() plus uplpgsql_sync_native_arrays_for_expr()
+ * syncs only what that expression actually reads.
  */
 static inline LLVMValueRef
-uplpgsql_call_exec(UPLpgSQL_compile_ctx *ctx, void *fn_addr,
-				   LLVMTypeRef ret_type,
-				   LLVMValueRef *args, unsigned count)
+uplpgsql_call_exec_nosync(UPLpgSQL_compile_ctx *ctx, void *fn_addr,
+						  LLVMTypeRef ret_type,
+						  LLVMValueRef *args, unsigned count)
 {
 	LLVMTypeRef		param_types[4];
 	LLVMTypeRef		fn_type;
 	LLVMValueRef	fn_ptr;
 	unsigned		i;
 	const char	   *call_name;
-
-	uplpgsql_sync_native_arrays(ctx);
 
 	for (i = 0; i < count && i < 4; i++)
 		param_types[i] = LLVMTypeOf(args[i]);
@@ -248,6 +256,21 @@ uplpgsql_call_exec(UPLpgSQL_compile_ctx *ctx, void *fn_addr,
 
 	return LLVMBuildCall2(ctx->builder, fn_type, fn_ptr,
 						  args, count, call_name);
+}
+
+/*
+ * Call an exec_* function, marshalling every native array first.
+ *
+ * The safe default, and what every caller without a known expression uses.
+ */
+static inline LLVMValueRef
+uplpgsql_call_exec(UPLpgSQL_compile_ctx *ctx, void *fn_addr,
+				   LLVMTypeRef ret_type,
+				   LLVMValueRef *args, unsigned count)
+{
+	uplpgsql_sync_native_arrays(ctx);
+
+	return uplpgsql_call_exec_nosync(ctx, fn_addr, ret_type, args, count);
 }
 
 /* ----------------------------------------------------------------
@@ -2301,6 +2324,41 @@ uplpgsql_sync_native_arrays(UPLpgSQL_compile_ctx *ctx)
 }
 
 /*
+ * Marshal only the native arrays that an expression reads.
+ *
+ * The interpreter reads variables as Datums, so any native array the
+ * expression touches must be marshalled out to its Datum first — but only
+ * those.  Syncing the rest costs a full copy of each, per execution, for
+ * data the callee cannot even see: three "least(greatest(x,0),1)" clamps per
+ * pixel dragged a 6912-element image array through construct_md_array every
+ * time, and cost more than the path tracer around them.
+ *
+ * paramnos is exactly the set of variables the expression reads, and it is
+ * what escape analysis already trusts for RETURN/RAISE/FOREACH.  A NULL expr
+ * means we cannot tell, so fall back to marshalling everything.
+ */
+static void
+uplpgsql_sync_native_arrays_for_expr(UPLpgSQL_compile_ctx *ctx,
+									 UPLpgSQL_expr *expr)
+{
+	int		na_i;
+
+	if (expr == NULL)
+	{
+		uplpgsql_sync_native_arrays(ctx);
+		return;
+	}
+
+	for (na_i = 0; na_i < ctx_num_native_arrays(ctx); na_i++)
+	{
+		UPLpgSQL_native_array *na = &ctx_native_arrays(ctx)[na_i];
+
+		if (expr_references_dno(expr, na->dno))
+			uplpgsql_emit_sync_native_array(ctx, na);
+	}
+}
+
+/*
  * Look up native array metadata by dno, or NULL if dno is not one.
  */
 static UPLpgSQL_native_array *
@@ -2423,8 +2481,14 @@ uplpgsql_compile_assign(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_assign *stmt)
 		args[1] = datum_ptr;
 		args[2] = llvm_const_ptr(ctx, stmt->expr);
 
-		uplpgsql_call_exec(ctx, (void *) exec_assign_expr,
-						   ctx->types[UPLPGSQL_VOID], args, 3);
+		/*
+		 * exec_assign_expr reads exactly what stmt->expr reads, so marshal
+		 * only that.  An assignment whose value happens not to compile must
+		 * not drag every other array in the function through a round trip.
+		 */
+		uplpgsql_sync_native_arrays_for_expr(ctx, stmt->expr);
+		uplpgsql_call_exec_nosync(ctx, (void *) exec_assign_expr,
+								  ctx->types[UPLPGSQL_VOID], args, 3);
 	}
 
 	/*

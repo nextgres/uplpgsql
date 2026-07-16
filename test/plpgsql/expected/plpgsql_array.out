@@ -802,3 +802,83 @@ drop function na_store_null_extend();
 drop function na_store_cast(int);
 drop function na_store_cast_int8();
 drop function na_store_cast_oob();
+--
+-- A statement that falls back to the interpreter marshals only the native
+-- arrays it reads.
+--
+-- Flat memory is the live copy, so anything the interpreter reads has to be
+-- marshalled out to its Datum first.  Doing that for every native array in
+-- the function regardless is correct but costs a full copy of each, per
+-- execution, for data the callee never looks at -- enough to make a JIT'd
+-- function slower than the interpreter.  These pin the correctness half: an
+-- expression that reaches the interpreter must still see live data for the
+-- arrays it does read, while other arrays are mid-flight with stale Datums.
+--
+-- greatest()/least() are the lever: a MinMaxExpr reaches neither tier, so
+-- these assignments genuinely fall back.
+--
+create function na_selective_sync() returns text language uplpgsql as $$
+declare a int[] := ARRAY[1,2,3]; b int[] := ARRAY[9,9,9]; r int;
+begin
+  a[1] := 42;                    -- native writes: both Datums now stale
+  b[1] := 77;
+  r := greatest(a[1], 0);        -- falls back, reads a but not b
+  return r::text || ' ' || a::text || ' ' || b::text;
+end; $$;
+select na_selective_sync();
+  na_selective_sync   
+----------------------
+ 42 {42,2,3} {77,9,9}
+(1 row)
+
+-- the fallback reads the *other* array, after both have been written
+create function na_selective_sync2() returns text language uplpgsql as $$
+declare a int[] := ARRAY[1,2,3]; b int[] := ARRAY[9,9,9]; r int;
+begin
+  a[2] := 5;
+  b[2] := 6;
+  r := least(b[2], 100);         -- falls back, reads b but not a
+  return r::text || ' ' || a::text || ' ' || b::text;
+end; $$;
+select na_selective_sync2();
+ na_selective_sync2 
+--------------------
+ 6 {1,5,3} {9,6,9}
+(1 row)
+
+-- a fallback reading both, and one reading neither, interleaved with writes
+create function na_selective_sync3() returns text language uplpgsql as $$
+declare a int[] := ARRAY[1,2]; b int[] := ARRAY[3,4]; x int := 7; r int; q int;
+begin
+  a[1] := 10;
+  b[1] := 20;
+  q := greatest(x, 0);           -- falls back, reads no array at all
+  r := greatest(a[1], b[1]);     -- falls back, reads both
+  a[2] := 11;                    -- keep writing after the round trips
+  return q::text || ' ' || r::text || ' ' || a::text || ' ' || b::text;
+end; $$;
+select na_selective_sync3();
+ na_selective_sync3  
+---------------------
+ 7 20 {10,11} {20,4}
+(1 row)
+
+-- whole-datum read of an array in a fallback expression
+create function na_selective_whole() returns text language uplpgsql as $$
+declare a int[] := ARRAY[1,2,3]; b int[] := ARRAY[9,9,9]; c int[];
+begin
+  a[3] := 30;
+  b[3] := 90;
+  c := a || b;                   -- falls back, reads both whole arrays
+  return c::text;
+end; $$;
+select na_selective_whole();
+ na_selective_whole 
+--------------------
+ {1,2,30,9,9,90}
+(1 row)
+
+drop function na_selective_sync();
+drop function na_selective_sync2();
+drop function na_selective_sync3();
+drop function na_selective_whole();
