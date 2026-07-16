@@ -2871,6 +2871,35 @@ uplpgsql_compile_expr_fmgr_full(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 				nargs = list_length(args);
 
 				/*
+				 * float8(numeric-constant) → fold to a float8 Datum at
+				 * compile time, exactly as the Tier 1 float path does.
+				 *
+				 * This is not just an optimisation.  Left as a runtime call,
+				 * numeric_float8 allocates transient memory on every
+				 * invocation, and a JIT'd loop -- unlike the interpreter --
+				 * never resets the context that memory lands in, so a numeric
+				 * literal inside any fmgr-bypass expression (a comparison under
+				 * AND/OR, an argument to a cast) leaks without bound.
+				 * "t2 > 0.0001 AND ..." in a hot loop was enough to exhaust
+				 * memory and have the backend killed.  Folding removes the call.
+				 */
+				if (IsA(expr, FuncExpr) && funcid == F_FLOAT8_NUMERIC &&
+					IsA(linitial(args), Const))
+				{
+					Const *c = (Const *) linitial(args);
+
+					if (c->constisnull)
+					{
+						if (isnull_out)
+							*isnull_out = LLVMConstInt(i1, 1, false);
+						return LLVMConstInt(i64, 0, false);
+					}
+					return LLVMConstInt(i64, (uint64)
+						OidFunctionCall1(F_FLOAT8_NUMERIC, c->constvalue),
+						false);
+				}
+
+				/*
 				 * Polymorphic functions (e.g. textanycat) cannot be called
 				 * directly via fmgr bypass because the FunctionCallInfo we
 				 * build doesn't carry polymorphic type resolution info.

@@ -850,3 +850,54 @@ drop function fn_zero_mul(); drop function fn_div_inf(); drop function fn_nan_ad
 drop function fn_normal(); drop function fn_neg(); drop function fn_cmp();
 drop function fn_cmp_if(); drop function fn_null_add(); drop function fn_null_div0();
 drop function fn_null_ovf(); drop function fn_null_cmp(); drop function fn_array_sum();
+
+--
+-- float8(numeric) constant folding under fmgr bypass.
+--
+-- A numeric literal reached through the fmgr-bypass path -- inside a cast, an
+-- argument, or a comparison under AND/OR -- must be folded to a float8 value
+-- at compile time, not left as a per-call float8(numeric) conversion.  Left as
+-- a runtime call it both risks a wrong value and leaks transient memory on
+-- every evaluation (the JIT'd loop never resets the context the interpreter
+-- would), enough to exhaust memory in a hot loop.  These check the values fold
+-- correctly; the differential run against stock PL/pgSQL is what pins them.
+--
+create function fold_cast_top() returns int language uplpgsql as $$
+begin return floor(power(2.0, 0.45)*255.0 + 0.5)::int; end; $$;
+select fold_cast_top();
+
+create function fold_mul_cast() returns int language uplpgsql as $$
+begin return (3.7 * 2.5)::int; end; $$;
+select fold_mul_cast();
+
+create function fold_cmp_and() returns bool language uplpgsql as $$
+begin return 1.5 > 0.0001 and 2.5 < 1e20; end; $$;
+select fold_cmp_and();
+
+create function fold_neg_sci() returns int[] language uplpgsql as $$
+declare a int[]; begin
+  a[1] := (-1.9)::int;
+  a[2] := floor(1e-3 * 1000.0)::int;
+  a[3] := (0.0::float8)::int;
+  return a;
+end; $$;
+select fold_neg_sci();
+
+-- exercised in a loop, which is where a per-call leak would have shown
+create function fold_in_loop(n int) returns int language uplpgsql as $$
+declare s int := 0; i int;
+begin
+  for i in 1..n loop
+    if i::float8 > 0.5 and i::float8 < 1e9 then
+      s := (s + floor(i::float8 * 1.5 + 0.5)::int) % 100000;
+    end if;
+  end loop;
+  return s;
+end; $$;
+select fold_in_loop(1000);
+
+drop function fold_cast_top();
+drop function fold_mul_cast();
+drop function fold_cmp_and();
+drop function fold_neg_sci();
+drop function fold_in_loop(int);
