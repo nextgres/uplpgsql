@@ -2573,6 +2573,74 @@ uplpgsql_can_fmgr_compile(Expr *expr)
 }
 
 /*
+ * Does this fmgr-bypass expression allocate transient memory when it runs?
+ *
+ * True if any function or operator in the tree returns a pass-by-reference
+ * type -- numeric, text, and friends palloc their result (and any by-ref
+ * intermediate) in the current context.  The caller uses this to decide
+ * whether the statement needs an allocation scope around it; a tree of only
+ * by-value results (int and float arithmetic, comparisons, casts to int)
+ * allocates nothing and needs no scope, so the common path pays nothing.
+ *
+ * The typbyval lookups are compile-time only.
+ */
+static bool
+fmgr_expr_allocates(Expr *expr)
+{
+	if (expr == NULL)
+		return false;
+
+	switch (nodeTag(expr))
+	{
+		case T_OpExpr:
+			{
+				OpExpr	   *op = (OpExpr *) expr;
+				ListCell   *lc;
+
+				if (OidIsValid(op->opresulttype) &&
+					!get_typbyval(op->opresulttype))
+					return true;
+				foreach(lc, op->args)
+					if (fmgr_expr_allocates((Expr *) lfirst(lc)))
+						return true;
+				return false;
+			}
+
+		case T_FuncExpr:
+			{
+				FuncExpr   *f = (FuncExpr *) expr;
+				ListCell   *lc;
+
+				if (OidIsValid(f->funcresulttype) &&
+					!get_typbyval(f->funcresulttype))
+					return true;
+				foreach(lc, f->args)
+					if (fmgr_expr_allocates((Expr *) lfirst(lc)))
+						return true;
+				return false;
+			}
+
+		case T_RelabelType:
+			return fmgr_expr_allocates(((RelabelType *) expr)->arg);
+
+		case T_BoolExpr:
+			{
+				BoolExpr   *b = (BoolExpr *) expr;
+				ListCell   *lc;
+
+				foreach(lc, b->args)
+					if (fmgr_expr_allocates((Expr *) lfirst(lc)))
+						return true;
+				return false;
+			}
+
+		default:
+			/* Const, Param: a value, not a fresh allocation. */
+			return false;
+	}
+}
+
+/*
  * Emit IR to load a variable's Datum value for use as a function argument.
  * Returns the Datum as i64.
  */
@@ -3461,6 +3529,23 @@ uplpgsql_try_compile_assign(UPLpgSQL_compile_ctx *ctx,
 		if (target_var->datatype->typbyval)
 		{
 			LLVMValueRef	isnull_val;
+			bool			scoped = fmgr_expr_allocates(expr);
+			LLVMValueRef	old = NULL;
+
+			/*
+			 * A by-value result can still be reached through a by-reference
+			 * intermediate -- length(upper(t)) returns int4 but allocated a
+			 * text along the way.  Bracket the evaluation so that text is
+			 * freed; a tree of only by-value operators needs no scope.
+			 */
+			if (scoped)
+			{
+				LLVMValueRef a[] = { estate_ref };
+
+				old = LLVMBuildCall2(ctx->builder,
+					ctx->rt_fntypes[RT_ALLOC_SCOPE_ENTER],
+					ctx->rt_funcs[RT_ALLOC_SCOPE_ENTER], a, 1, "scope.old");
+			}
 
 			/*
 			 * Take the isnull the expression computed, rather than assuming
@@ -3478,7 +3563,24 @@ uplpgsql_try_compile_assign(UPLpgSQL_compile_ctx *ctx,
 				uplpgsql_emit_store_var_datum_isnull(ctx, estate_ref,
 													 stmt->varno, datum_val,
 													 isnull_val);
+				if (scoped)
+				{
+					LLVMValueRef a[] = { estate_ref, old };
+
+					LLVMBuildCall2(ctx->builder,
+						ctx->rt_fntypes[RT_ALLOC_SCOPE_EXIT],
+						ctx->rt_funcs[RT_ALLOC_SCOPE_EXIT], a, 2, "");
+				}
 				return true;
+			}
+			/* fmgr_full bailed: restore the context before Tier 3 */
+			if (scoped)
+			{
+				LLVMValueRef a[] = { estate_ref, old };
+
+				LLVMBuildCall2(ctx->builder,
+					ctx->rt_fntypes[RT_ALLOC_SCOPE_EXIT],
+					ctx->rt_funcs[RT_ALLOC_SCOPE_EXIT], a, 2, "");
 			}
 			/* Fall through to Tier 3 */
 		}
@@ -3487,14 +3589,30 @@ uplpgsql_try_compile_assign(UPLpgSQL_compile_ctx *ctx,
 			/*
 			 * Pass-by-reference Tier 2.
 			 *
-			 * Always use RT_COPY_ASSIGN_VAR_DATUM to prevent
-			 * use-after-free.  The PG function result is palloc'd
-			 * and palloc may reuse the same block that held the old
-			 * variable value (freed by assign_simple_var).  datumCopy
-			 * ensures the stored value is at a distinct address in
-			 * datum_context.
+			 * datumCopy prevents use-after-free either way: the palloc'd
+			 * result may reuse the block that held the old variable value.
+			 *
+			 * When the expression contains an allocating call (upper(t),
+			 * a || b, ...) bracket it in an allocation scope so the result and
+			 * any intermediates are freed rather than leaked;
+			 * RT_COPY_ASSIGN_VAR_DATUM_SCOPED copies the result into the
+			 * durable context before resetting the scope.  A bare variable or
+			 * constant read (y := x) allocates nothing and must NOT be scoped:
+			 * reading a native array whole-datum syncs it into the variable's
+			 * own slot, and resetting the scope would free that live value.
 			 */
 			LLVMValueRef	isnull_val;
+			bool			scoped = fmgr_expr_allocates(expr);
+			LLVMValueRef	old = NULL;
+
+			if (scoped)
+			{
+				LLVMValueRef a[] = { estate_ref };
+
+				old = LLVMBuildCall2(ctx->builder,
+					ctx->rt_fntypes[RT_ALLOC_SCOPE_ENTER],
+					ctx->rt_funcs[RT_ALLOC_SCOPE_ENTER], a, 1, "scope.old");
+			}
 
 			datum_val = uplpgsql_compile_expr_fmgr_full(ctx, expr, estate_ref,
 														&isnull_val);
@@ -3504,6 +3622,22 @@ uplpgsql_try_compile_assign(UPLpgSQL_compile_ctx *ctx,
 				elog(DEBUG1, "uplpgsql: fmgr bypass (pass-by-ref, copy) assignment to dno %d: %s",
 					 stmt->varno, stmt->expr->query);
 
+				if (scoped)
+				{
+					LLVMValueRef args[] = {
+						estate_ref,
+						LLVMConstInt(ctx->types[UPLPGSQL_INT32], stmt->varno, false),
+						datum_val,
+						LLVMBuildZExt(ctx->builder, isnull_val,
+									  ctx->types[UPLPGSQL_INT8], "isnull.i8"),
+						old
+					};
+					LLVMBuildCall2(ctx->builder,
+						ctx->rt_fntypes[RT_COPY_ASSIGN_VAR_DATUM_SCOPED],
+						ctx->rt_funcs[RT_COPY_ASSIGN_VAR_DATUM_SCOPED],
+						args, 5, "");
+				}
+				else
 				{
 					LLVMValueRef args[] = {
 						estate_ref,
@@ -3535,6 +3669,15 @@ uplpgsql_try_compile_assign(UPLpgSQL_compile_ctx *ctx,
 					}
 				}
 				return true;
+			}
+			/* fmgr_full bailed: restore the context before Tier 3 */
+			if (scoped)
+			{
+				LLVMValueRef a[] = { estate_ref, old };
+
+				LLVMBuildCall2(ctx->builder,
+					ctx->rt_fntypes[RT_ALLOC_SCOPE_EXIT],
+					ctx->rt_funcs[RT_ALLOC_SCOPE_EXIT], a, 2, "");
 			}
 			/* Fall through to Tier 3 */
 		}
@@ -4477,11 +4620,30 @@ uplpgsql_try_compile_bool(UPLpgSQL_compile_ctx *ctx,
 	{
 		LLVMValueRef	datum_result;
 		LLVMValueRef	isnull_val = NULL;
+		bool			scoped = fmgr_expr_allocates(expr);
+		LLVMValueRef	old = NULL;
 
 		elog(DEBUG1, "uplpgsql: fmgr bypass bool expression: %s",
 			 expr_node->query);
 
 		estate_ref = LLVMGetParam(ctx->function, 0);
+
+		/*
+		 * A condition can allocate through an intermediate too --
+		 * "length(upper(t)) > 3" builds a text every time.  The bool result
+		 * is by value, so bracket the evaluation and reset the scope once the
+		 * i1 is in hand.  A comparison of plain values allocates nothing and
+		 * is not scoped.
+		 */
+		if (scoped)
+		{
+			LLVMValueRef a[] = { estate_ref };
+
+			old = LLVMBuildCall2(ctx->builder,
+				ctx->rt_fntypes[RT_ALLOC_SCOPE_ENTER],
+				ctx->rt_funcs[RT_ALLOC_SCOPE_ENTER], a, 1, "scope.old");
+		}
+
 		datum_result = uplpgsql_compile_expr_fmgr_full(ctx, expr, estate_ref,
 													   &isnull_val);
 		if (datum_result != NULL)
@@ -4502,7 +4664,24 @@ uplpgsql_try_compile_bool(UPLpgSQL_compile_ctx *ctx,
 									   LLVMBuildNot(ctx->builder, isnull_val,
 													"fmgr.bool.notnull"),
 									   "fmgr.bool.cond");
+			if (scoped)
+			{
+				LLVMValueRef a[] = { estate_ref, old };
+
+				LLVMBuildCall2(ctx->builder,
+					ctx->rt_fntypes[RT_ALLOC_SCOPE_EXIT],
+					ctx->rt_funcs[RT_ALLOC_SCOPE_EXIT], a, 2, "");
+			}
 			return true;
+		}
+		/* fmgr_full bailed: restore the context before Tier 3 */
+		if (scoped)
+		{
+			LLVMValueRef a[] = { estate_ref, old };
+
+			LLVMBuildCall2(ctx->builder,
+				ctx->rt_fntypes[RT_ALLOC_SCOPE_EXIT],
+				ctx->rt_funcs[RT_ALLOC_SCOPE_EXIT], a, 2, "");
 		}
 		/* Fall through to Tier 3 */
 	}

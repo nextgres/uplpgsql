@@ -154,6 +154,9 @@ typedef enum UPLpgSQL_rt_func
 	RT_EXCEPTION_RETHROW,
 	RT_ASSIGN_VAR_DATUM,
 	RT_COPY_ASSIGN_VAR_DATUM,
+	RT_ALLOC_SCOPE_ENTER,
+	RT_ALLOC_SCOPE_EXIT,
+	RT_COPY_ASSIGN_VAR_DATUM_SCOPED,
 	RT_GET_RECFIELD,
 	RT_GET_RECFIELD_FAST,
 	RT_ARRAY_GET_ELEMENT,
@@ -431,6 +434,13 @@ extern void uplpgsql_rt_assign_var_datum(UPLpgSQL_exec_state *estate,
 extern void uplpgsql_rt_copy_assign_var_datum(UPLpgSQL_exec_state *estate,
 											  int dno, Datum value,
 											  bool isnull);
+extern MemoryContext uplpgsql_rt_alloc_scope_enter(UPLpgSQL_exec_state *estate);
+extern void uplpgsql_rt_alloc_scope_exit(UPLpgSQL_exec_state *estate,
+										 MemoryContext old);
+extern void uplpgsql_rt_copy_assign_var_datum_scoped(UPLpgSQL_exec_state *estate,
+													 int dno, Datum value,
+													 bool isnull,
+													 MemoryContext old);
 
 /* Runtime helpers for record field access from inlined expressions */
 extern Datum uplpgsql_rt_get_recfield(UPLpgSQL_exec_state *estate,

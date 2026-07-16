@@ -901,3 +901,70 @@ drop function fold_mul_cast();
 drop function fold_cmp_and();
 drop function fold_neg_sci();
 drop function fold_in_loop(int);
+
+--
+-- Allocation scope around fmgr-bypass calls that palloc.
+--
+-- A by-reference built-in (numeric_add, textcat, upper, ...) allocates its
+-- result and any by-ref intermediate in the current context.  The interpreter
+-- resets that context after each statement; a JIT'd loop does not, so without
+-- an explicit scope the memory accumulates without bound.  The emitter now
+-- brackets any assignment or condition whose expression contains a by-ref call
+-- in an allocation scope that is reset once the result is copied out.  These
+-- check the values survive that copy-and-reset correctly, in both an
+-- assignment and a condition, for a by-ref result and for a by-value result
+-- reached through a by-ref intermediate.  (The leak itself is not observable
+-- from SQL; the differential run against stock PL/pgSQL is what pins these.)
+--
+create function scope_numeric(n int) returns numeric language uplpgsql as $$
+declare a numeric := 0; i int;
+begin for i in 1..n loop a := a + 1.5; end loop; return a; end; $$;
+select scope_numeric(100);
+
+create function scope_text(n int) returns text language uplpgsql as $$
+declare t text := 'a'; i int;
+begin
+  for i in 1..n loop
+    t := upper(t) || substr(md5(t), 1, 1);
+    if length(t) > 12 then t := 'a'; end if;
+  end loop;
+  return t;
+end; $$;
+select scope_text(50);
+
+-- condition with an allocating intermediate
+create function scope_cond(n int) returns int language uplpgsql as $$
+declare t text := 'hello'; s int := 0; i int;
+begin
+  for i in 1..n loop
+    if length(upper(t)) > 3 then s := s + 1; end if;
+  end loop;
+  return s;
+end; $$;
+select scope_cond(100);
+
+-- by-value result reached through a by-ref intermediate
+create function scope_byval_intermediate(n int) returns int language uplpgsql as $$
+declare t text := 'abc'; s int := 0; i int;
+begin
+  for i in 1..n loop s := s + length(upper(t) || 'zz'); end loop;
+  return s;
+end; $$;
+select scope_byval_intermediate(100);
+
+-- NULL through the scoped path must still assign NULL, not 0/empty
+create function scope_null() returns text language uplpgsql as $$
+declare a numeric; b numeric := 2; t text; u text := 'x';
+begin
+  a := a + 1;          -- NULL numeric arithmetic -> NULL
+  t := upper(t);       -- NULL text -> NULL
+  return coalesce(a::text,'<null>') || '|' || coalesce(t,'<null>')
+      || '|' || coalesce((b+1)::text,'?') || '|' || coalesce(upper(u),'?');
+end; $$;
+select scope_null();
+
+drop function scope_numeric(int);
+drop function scope_text(int);
+drop function scope_cond(int);
+drop function scope_byval_intermediate(int);
+drop function scope_null();

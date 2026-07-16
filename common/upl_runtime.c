@@ -1440,6 +1440,77 @@ uplpgsql_rt_copy_assign_var_datum(UPLpgSQL_exec_state *estate,
 }
 
 /*
+ * Transient-allocation scope for a JIT'd statement that evaluates a
+ * pass-by-reference built-in via fmgr bypass.
+ *
+ * The interpreter evaluates every expression in the eval_econtext's per-tuple
+ * memory and resets it after each statement (exec_eval_cleanup).  The fmgr
+ * bypass instead calls the function with CurrentMemoryContext left at the SPI
+ * proc context -- function-lifespan memory -- and never resets it.  For a
+ * pure-arithmetic function that allocates nothing this is harmless, but a
+ * function that palloc's its result or an intermediate (numeric_add, textcat,
+ * ...) leaks that memory on every call, without bound, in a loop.
+ *
+ * These bracket such a statement: _enter switches allocation into the
+ * per-tuple context and returns the previous context; _exit restores it and
+ * resets the per-tuple context, freeing everything the function left behind.
+ * The store between them must copy the result somewhere durable first --
+ * uplpgsql_rt_copy_assign_var_datum_scoped() does that -- because the result
+ * itself lives in the context about to be reset.
+ *
+ * The emitter only brackets statements whose expression actually contains a
+ * by-reference call, so Tier 1 arithmetic and by-value Tier 2 (comparisons,
+ * the LCG, casts to int) pay nothing.
+ */
+UPLPGSQL_RT_EXPORT MemoryContext
+uplpgsql_rt_alloc_scope_enter(UPLpgSQL_exec_state *estate)
+{
+	UPLpgSQL_execstate *plstate = estate->uplpgsql_estate;
+
+	return MemoryContextSwitchTo(plstate->eval_econtext->ecxt_per_tuple_memory);
+}
+
+UPLPGSQL_RT_EXPORT void
+uplpgsql_rt_alloc_scope_exit(UPLpgSQL_exec_state *estate, MemoryContext old)
+{
+	UPLpgSQL_execstate *plstate = estate->uplpgsql_estate;
+
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(plstate->eval_econtext->ecxt_per_tuple_memory);
+}
+
+/*
+ * Copy-assign a pass-by-reference result out of the transient scope, then
+ * reset it.  Mirrors uplpgsql_rt_copy_assign_var_datum, but switches back to
+ * the durable context first so the copy survives the reset, and resets the
+ * per-tuple context afterwards (freeing the function's result and any
+ * intermediates).  `old` is the context returned by _alloc_scope_enter.
+ */
+UPLPGSQL_RT_EXPORT void
+uplpgsql_rt_copy_assign_var_datum_scoped(UPLpgSQL_exec_state *estate,
+										 int dno, Datum value, bool isnull,
+										 MemoryContext old)
+{
+	UPLpgSQL_execstate *plstate = estate->uplpgsql_estate;
+	UPLpgSQL_var	   *var = (UPLpgSQL_var *) plstate->datums[dno];
+
+	MemoryContextSwitchTo(old);
+
+	if (!isnull)
+	{
+		Datum	copied;
+
+		copied = datumCopy(value, var->datatype->typbyval,
+						   var->datatype->typlen);
+		assign_simple_var(plstate, var, copied, false, true);
+	}
+	else
+		assign_simple_var(plstate, var, (Datum) 0, true, false);
+
+	MemoryContextReset(plstate->eval_econtext->ecxt_per_tuple_memory);
+}
+
+/*
  * uplpgsql_rt_get_recfield - Extract a field value from a record variable.
  *
  * Used by inlined expressions that reference record fields (e.g. r.a).

@@ -1940,6 +1940,37 @@ uplpgsql_register_runtime_funcs(UPLpgSQL_compile_ctx *ctx)
 			"uplpgsql_rt_copy_assign_var_datum", ft);
 	}
 
+	/* ptr uplpgsql_rt_alloc_scope_enter(ptr estate) */
+	{
+		LLVMTypeRef params[] = { ptr };
+		LLVMTypeRef ft = LLVMFunctionType(ptr, params, 1, false);
+
+		ctx->rt_fntypes[RT_ALLOC_SCOPE_ENTER] = ft;
+		ctx->rt_funcs[RT_ALLOC_SCOPE_ENTER] = LLVMAddFunction(ctx->module,
+			"uplpgsql_rt_alloc_scope_enter", ft);
+	}
+
+	/* void uplpgsql_rt_alloc_scope_exit(ptr estate, ptr old) */
+	{
+		LLVMTypeRef params[] = { ptr, ptr };
+		LLVMTypeRef ft = LLVMFunctionType(vd, params, 2, false);
+
+		ctx->rt_fntypes[RT_ALLOC_SCOPE_EXIT] = ft;
+		ctx->rt_funcs[RT_ALLOC_SCOPE_EXIT] = LLVMAddFunction(ctx->module,
+			"uplpgsql_rt_alloc_scope_exit", ft);
+	}
+
+	/* void uplpgsql_rt_copy_assign_var_datum_scoped(ptr, i32, i64, i8, ptr) */
+	{
+		LLVMTypeRef i8t = ctx->types[UPLPGSQL_INT8];
+		LLVMTypeRef params[] = { ptr, i32, i64, i8t, ptr };
+		LLVMTypeRef ft = LLVMFunctionType(vd, params, 5, false);
+
+		ctx->rt_fntypes[RT_COPY_ASSIGN_VAR_DATUM_SCOPED] = ft;
+		ctx->rt_funcs[RT_COPY_ASSIGN_VAR_DATUM_SCOPED] = LLVMAddFunction(
+			ctx->module, "uplpgsql_rt_copy_assign_var_datum_scoped", ft);
+	}
+
 	/* i64 uplpgsql_rt_get_recfield(ptr estate, i32 recfield_dno) */
 	{
 		LLVMTypeRef params[] = { ptr, i32 };
