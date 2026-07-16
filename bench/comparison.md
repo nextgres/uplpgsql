@@ -43,7 +43,7 @@ Ratios are the point of comparison; absolute times are machine-specific.
 | branch and nested loop     | 3376.6 | 338.8 | 10.0x |
 | int8 arithmetic            |  755.4 |  92.7 |  8.1x |
 | numeric arithmetic         |  493.9 | 386.1 |  1.3x |
-| array element writes       |   25.0 |  31.7 |  0.8x |
+| array element writes       |   24.6 |   6.7 |  3.7x |
 | Cornell box path tracer    | 43953.9 | 3010.7 | 14.6x |
 
 All workloads returned identical values under both engines.
@@ -65,23 +65,31 @@ s := s + 1.0::float8/(i*i)::float8;   -- float8
 are different workloads. The first is the 1.3x row; the second is the 21.8x
 row. Both appear above under their real names.
 
-**Array element writes are at parity, and the array is not the reason.**
-Separating the two halves of that workload:
+**Array element writes are the lowest-ratio compiled row, and the reason is
+the value expression, not the store.** Separating the two halves:
 
 | | interpreter | uplpgsql | ratio |
 |---|---:|---:|---:|
 | `t[i] := i` — Tier 1 value, native store | 20.0 ms | 2.0 ms | 10.3x |
-| `floor(power(v,0.45)*255.0+0.5)::int` — no array at all | 10.6 ms | 31.7 ms | **0.3x** |
+| `floor(power(v,0.45)*255.0+0.5)::int` — no array at all | 10.9 ms | 6.6 ms | 1.6x |
 
-The native store is fine. The value expression is the problem: it needs three
-Tier 2 calls (`power`, `floor`, and the cast), and Tier 2 is currently slower
-than the interpreter. The `FunctionCallInfo` is allocated once in the entry
-block, but it is zeroed and its `flinfo`/`context`/`resultinfo`/`fncollation`/
-`nargs` fields are rewritten on every call, all of which are loop-invariant.
-PostgreSQL's own expression interpreter initialises its `FunctionCallInfo` once
-when the `ExprState` is built and writes only the arguments per call. Hoisting
-that initialisation is an open optimisation; until it lands, an expression
-dominated by function calls gains nothing from being compiled.
+The native store is fine. The value expression is where the gap is: it is a
+tree of Tier 2 calls (`power`, `floor`, the cast), and Tier 2 does not compile
+as tightly as Tier 1's native arithmetic. It still beats the interpreter here,
+but only 1.6x against 10x for the store, so the mixed workload lands in
+between.
+
+Two Tier 2 costs account for the gap. First, `float8` casts of numeric
+literals inside the expression were being emitted as per-call
+`float8(numeric)` conversions — measured at 0.3x, slower than the interpreter,
+and leaking memory besides — until they were folded to constants at compile
+time; that is what moved this row from 0.8x to 3.7x. Second, what remains: the
+`FunctionCallInfo` is allocated once in the entry block, but it is zeroed and
+its `flinfo`/`context`/`resultinfo`/`fncollation`/`nargs` fields are rewritten
+on every call, all loop-invariant. PostgreSQL's own interpreter initialises
+its `FunctionCallInfo` once when the `ExprState` is built and writes only the
+arguments per call. Hoisting that initialisation is an open optimisation that
+would narrow the remaining Tier 2 gap.
 
 **The Cornell box** (`cornell.sql`) is the closest thing here to real code:
 float8 throughout, a scene held in arrays read once per sphere per bounce,
