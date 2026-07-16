@@ -226,6 +226,159 @@ $$ LANGUAGE uplpgsql;
 
 select exit_block1();
 
+--
+-- EXIT with a block label.
+--
+-- A labeled BEGIN...END is an EXIT target just as a loop is, so codegen has to
+-- push it onto the same stack -- but only as an EXIT target: an unlabeled
+-- EXIT/CONTINUE must look straight through it to the innermost real loop, and
+-- CONTINUE may never name a block.  When the block carries an exception
+-- handler the jump also has to run the subtransaction release on its way out
+-- rather than branch past it.
+--
+create table exitblk_t (v int);
+
+-- control resumes after the block, skipping the rest of its body
+create function exit_block_resumes() returns int language uplpgsql as $$
+declare r int := 0;
+begin
+  <<b>> begin r := 1; exit b; r := 99; end;
+  r := r + 10;
+  return r;
+end; $$;
+select exit_block_resumes();
+
+-- EXIT unwinds out of nested loops to the block label
+create function exit_block_nested_loop() returns int language uplpgsql as $$
+declare r int := 0;
+begin
+  <<b>> begin
+    for i in 1..10 loop
+      for j in 1..10 loop r := r + 1; exit b; end loop;
+    end loop;
+  end;
+  return r;
+end; $$;
+select exit_block_nested_loop();
+
+-- conditional EXIT on a block label
+create function exit_block_when() returns int language uplpgsql as $$
+declare r int := 0;
+begin
+  <<b>> begin
+    for i in 1..10 loop r := r + 1; exit b when i = 4; end loop;
+  end;
+  return r;
+end; $$;
+select exit_block_when();
+
+-- an unlabeled EXIT inside a labeled block still targets the enclosing loop
+create function exit_unlabeled_in_block() returns int language uplpgsql as $$
+declare r int := 0;
+begin
+  for i in 1..5 loop
+    <<b>> begin r := r + 1; exit; end;
+  end loop;
+  return r;
+end; $$;
+select exit_unlabeled_in_block();
+
+-- inner vs outer block labels resolve independently
+create function exit_outer_from_inner() returns int language uplpgsql as $$
+declare r int := 0;
+begin
+  <<o>> begin <<i>> begin r := 1; exit o; end; r := 99; end;
+  return r;
+end; $$;
+select exit_outer_from_inner();
+
+create function exit_inner_only() returns int language uplpgsql as $$
+declare r int := 0;
+begin
+  <<o>> begin <<i>> begin r := 1; exit i; r := 50; end; r := r + 5; end;
+  return r;
+end; $$;
+select exit_inner_only();
+
+-- CONTINUE may not name a block label
+create function continue_block_label() returns int language uplpgsql as $$
+begin
+  <<b>> begin loop continue b; end loop; end;
+  return 1;
+end; $$;
+
+-- EXIT must name a label that actually encloses the statement
+create function exit_no_such_label() returns int language uplpgsql as $$
+begin
+  <<b>> begin exit zzz; end;
+  return 1;
+end; $$;
+
+-- EXIT out of a block that has an exception handler must still release the
+-- subtransaction: the inserted row has to survive
+create function exit_block_exc_subxact() returns int language uplpgsql as $$
+begin
+  <<b>> begin
+    insert into exitblk_t values (5);
+    exit b;
+  exception when others then null;
+  end;
+  return (select count(*)::int from exitblk_t);
+end; $$;
+truncate exitblk_t;
+select exit_block_exc_subxact();
+
+-- EXIT from inside a handler body leaves the block, running handler cleanup on
+-- the way: the failed insert rolls back, the handler's insert commits
+create function exit_handler_subxact() returns int language uplpgsql as $$
+begin
+  <<b>> begin
+    insert into exitblk_t values (1);
+    raise exception 'boom';
+  exception when others then
+    insert into exitblk_t values (2);
+    exit b;
+  end;
+  return (select count(*)::int from exitblk_t);
+end; $$;
+truncate exitblk_t;
+select exit_handler_subxact();
+
+-- statements after EXIT inside a handler are skipped
+create function exit_from_handler_body() returns int language uplpgsql as $$
+declare r int := 0;
+begin
+  <<b>> begin
+    raise exception 'boom';
+  exception when others then
+    r := 7; exit b; r := 99;
+  end;
+  return r + 1;
+end; $$;
+select exit_from_handler_body();
+
+-- exception handling still works in a later block after an EXIT-ed one
+create function exc_still_works_after_exit() returns int language uplpgsql as $$
+declare r int := 0;
+begin
+  <<b>> begin exit b; exception when others then r := 9; end;
+  begin raise exception 'x'; exception when others then r := 3; end;
+  return r;
+end; $$;
+select exc_still_works_after_exit();
+
+drop function exit_block_resumes();
+drop function exit_block_nested_loop();
+drop function exit_block_when();
+drop function exit_unlabeled_in_block();
+drop function exit_outer_from_inner();
+drop function exit_inner_only();
+drop function exit_block_exc_subxact();
+drop function exit_handler_subxact();
+drop function exit_from_handler_body();
+drop function exc_still_works_after_exit();
+drop table exitblk_t;
+
 -- verbose end block and end loop
 create function end_label1() returns void as $$
 <<blbl>>
@@ -554,3 +707,142 @@ drop function forc_basic();
 drop function forc_args();
 drop function forc_return();
 drop function forc_empty();
+
+--
+-- Simple CASE over types other than integer.
+--
+-- The parser cannot know what "CASE <expr> WHEN ..." tests, so it builds the
+-- temporary as an INT4 placeholder and expects the runtime to retype it to the
+-- test expression's real type.  Two things have to happen for that to work:
+-- the assignment must do the retyping, and the WHEN comparisons must not be
+-- planned before it -- a plan prepared against the placeholder binds the
+-- parameter as int4 and stays wrong.
+--
+create or replace function case_text() returns text language uplpgsql as $$
+declare a text := 'x'; r text;
+begin case a when 'x' then r := 'm'; else r := 'n'; end case; return r; end; $$;
+select case_text();
+
+create or replace function case_bool() returns text language uplpgsql as $$
+declare a bool := true; r text;
+begin case a when true then r := 'm'; else r := 'n'; end case; return r; end; $$;
+select case_bool();
+
+-- numeric is the one that returned the *wrong branch* rather than erroring,
+-- because its WHEN inlined and kept the int4-bound plan
+create or replace function case_numeric() returns text language uplpgsql as $$
+declare a numeric := 1.5; r text;
+begin case a when 1.5 then r := 'm'; else r := 'n'; end case; return r; end; $$;
+select case_numeric();
+
+create or replace function case_float8() returns text language uplpgsql as $$
+declare a float8 := 1.5; r text;
+begin case a when 1.5::float8 then r := 'm'; else r := 'n'; end case; return r; end; $$;
+select case_float8();
+
+create or replace function case_date() returns text language uplpgsql as $$
+declare a date := '2020-01-01'; r text;
+begin case a when '2020-01-01'::date then r := 'm'; else r := 'n'; end case; return r; end; $$;
+select case_date();
+
+create or replace function case_array() returns text language uplpgsql as $$
+declare a int[] := array[1,2]; r text;
+begin case a when array[1,2] then r := 'm'; else r := 'n'; end case; return r; end; $$;
+select case_array();
+
+-- integers must keep working
+create or replace function case_int() returns text language uplpgsql as $$
+declare a int := 1; r text;
+begin case a when 1 then r := 'm'; else r := 'n'; end case; return r; end; $$;
+select case_int();
+
+create or replace function case_bigint() returns text language uplpgsql as $$
+declare a bigint := 1; r text;
+begin case a when 1 then r := 'm'; else r := 'n'; end case; return r; end; $$;
+select case_bigint();
+
+-- branch selection, WHEN lists, ELSE, no-match and a NULL test value
+create or replace function case_else() returns text language uplpgsql as $$
+declare a text := 'z'; r text;
+begin case a when 'x' then r := 'm'; else r := 'n'; end case; return r; end; $$;
+select case_else();
+
+create or replace function case_multi() returns text language uplpgsql as $$
+declare a text := 'y'; r text;
+begin case a when 'x' then r := '1'; when 'y' then r := '2'; else r := '3'; end case; return r; end; $$;
+select case_multi();
+
+create or replace function case_when_list() returns text language uplpgsql as $$
+declare a int := 3; r text;
+begin case a when 1,2 then r := 'lo'; when 3,4 then r := 'hi'; else r := 'n'; end case; return r; end; $$;
+select case_when_list();
+
+create or replace function case_no_match() returns text language uplpgsql as $$
+declare a text := 'z';
+begin
+  case a when 'x' then return 'm'; end case;
+  return 'no';
+exception when case_not_found then return 'notfound';
+end; $$;
+select case_no_match();
+
+create or replace function case_null_test() returns text language uplpgsql as $$
+declare a text; r text;
+begin case a when 'x' then r := 'm'; else r := 'n'; end case; return r; end; $$;
+select case_null_test();
+
+create or replace function case_nested() returns text language uplpgsql as $$
+declare a text := 'x'; b int := 2; r text;
+begin
+  case a when 'x' then
+    case b when 2 then r := 'inner'; else r := 'no'; end case;
+  else r := 'outer';
+  end case;
+  return r;
+end; $$;
+select case_nested();
+
+-- the WHEN *bodies* must still compile normally: only the conditions are held
+-- back from compile-time planning
+create or replace function case_body(n int) returns bigint language uplpgsql as $$
+declare a text := 'x'; t bigint := 0; i int;
+begin
+  for i in 1..n loop
+    case a when 'x' then
+      t := t + i;
+      if t > 100000 then t := 0; end if;
+    else t := t - 1;
+    end case;
+  end loop;
+  return t;
+end; $$;
+select case_body(500);
+
+-- CASE over an array clears its temporary through assign_null, which must
+-- release a read/write expanded value properly rather than pfree its header
+create or replace function case_array_loop(n int) returns text language uplpgsql as $$
+declare a int[] := array[1,2]; r text; i int;
+begin
+  for i in 1..n loop
+    case a when array[1,2] then r := 'm'; else r := 'n'; end case;
+  end loop;
+  return r;
+end; $$;
+select case_array_loop(2000);
+
+drop function case_text();
+drop function case_bool();
+drop function case_numeric();
+drop function case_float8();
+drop function case_date();
+drop function case_array();
+drop function case_int();
+drop function case_bigint();
+drop function case_else();
+drop function case_multi();
+drop function case_when_list();
+drop function case_no_match();
+drop function case_null_test();
+drop function case_nested();
+drop function case_body(int);
+drop function case_array_loop(int);

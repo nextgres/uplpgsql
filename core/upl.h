@@ -93,10 +93,16 @@ typedef enum UPL_llvm_type
  * Each active loop pushes an entry with its label and the LLVM basic blocks
  * for CONTINUE (loop back) and EXIT (break out).  EXIT/CONTINUE statements
  * search the stack by label (NULL = innermost) to find the target blocks.
+ *
+ * A labeled BEGIN...END block is also an EXIT target, so it pushes an entry
+ * with is_loop = false and continue_bb = NULL.  Such entries are matched only
+ * by a labeled EXIT: an unlabeled EXIT/CONTINUE targets the innermost real
+ * loop and must look straight through them.
  */
 typedef struct UPL_loop_info
 {
 	const char		   *label;
+	bool				is_loop;
 	LLVMBasicBlockRef	continue_bb;
 	LLVMBasicBlockRef	exit_bb;
 	struct UPL_loop_info *next;
@@ -289,6 +295,18 @@ struct UPL_compile_ctx
 	/* Set to true when the function contains exception blocks */
 	bool				has_exceptions;
 
+	/*
+	 * Set while emitting a condition whose operand types are not yet settled,
+	 * so the driver must not prepare a plan for it at compile time.
+	 *
+	 * A simple CASE's WHEN conditions read the temporary variable holding the
+	 * test expression, and that variable's type is only fixed at run time (the
+	 * parser cannot know it, so it builds the variable as a placeholder).  A
+	 * plan prepared now would bind the parameter as the placeholder type and
+	 * stay wrong for the life of the compiled function.
+	 */
+	bool				defer_cond_plan;
+
 	/* Driver callbacks for body/expression compilation */
 	UPL_callbacks		callbacks;
 
@@ -414,6 +432,8 @@ extern void *upl_compile_function(UPL_compile_ctx *ctx,
 extern void upl_push_loop(UPL_compile_ctx *ctx, const char *label,
 						   LLVMBasicBlockRef continue_bb,
 						   LLVMBasicBlockRef exit_bb);
+extern void upl_push_block_label(UPL_compile_ctx *ctx, const char *label,
+								 LLVMBasicBlockRef exit_bb);
 extern void upl_pop_loop(UPL_compile_ctx *ctx);
 extern UPL_loop_info *upl_find_loop(UPL_compile_ctx *ctx, const char *label);
 

@@ -279,29 +279,20 @@ uplpgsql_cb_try_compile_bool(UPL_compile_ctx *ctx, void *expr,
 static void
 uplpgsql_cb_assign_expr(UPL_compile_ctx *ctx, int varno, void *expr)
 {
-	/* GEP to load plstate->datums[varno], call exec_assign_expr directly */
-	LLVMValueRef off, datums_gep, datums_ptr, elem_gep, datum_ptr;
+	/*
+	 * Go through uplpgsql_rt_case_assign_test rather than calling
+	 * exec_assign_expr directly: a simple CASE's temporary is an INT4
+	 * placeholder until the runtime retypes it to whatever the test
+	 * expression actually is, exactly as exec_stmt_case does.  Without that,
+	 * CASE over anything but an integer fails to coerce.
+	 */
 	LLVMValueRef args[3];
 
-	off = LLVMConstInt(ctx->types[UPLPGSQL_INT64],
-					   offsetof(UPLpgSQL_execstate, datums), false);
-	datums_gep = LLVMBuildGEP2(ctx->builder, ctx->types[UPLPGSQL_INT8],
-							   ctx_plstate(ctx), &off, 1, "datums.ptr");
-	datums_ptr = LLVMBuildLoad2(ctx->builder, ctx->types[UPLPGSQL_PTR],
-								datums_gep, "datums");
-
-	off = LLVMConstInt(ctx->types[UPLPGSQL_INT64],
-					   varno * sizeof(void *), false);
-	elem_gep = LLVMBuildGEP2(ctx->builder, ctx->types[UPLPGSQL_INT8],
-							 datums_ptr, &off, 1, "datum.gep");
-	datum_ptr = LLVMBuildLoad2(ctx->builder, ctx->types[UPLPGSQL_PTR],
-							   elem_gep, "datum");
-
-	args[0] = ctx_plstate(ctx);
-	args[1] = datum_ptr;
+	args[0] = LLVMGetParam(ctx->function, 0);
+	args[1] = upl_const_int32(ctx, varno);
 	args[2] = upl_const_ptr(ctx, expr);
 
-	uplpgsql_call_exec(ctx, (void *) exec_assign_expr,
+	uplpgsql_call_exec(ctx, (void *) uplpgsql_rt_case_assign_test,
 					   ctx->types[UPLPGSQL_VOID], args, 3);
 }
 
@@ -452,6 +443,7 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 	LLVMBasicBlockRef	try_exit_bb;
 	LLVMBasicBlockRef	exception_return_bb;
 	LLVMBasicBlockRef	handler_return_bb;
+	LLVMBasicBlockRef	handler_exit_bb;
 	LLVMBasicBlockRef	after_block_bb;
 	LLVMBasicBlockRef	rethrow_bb;
 	LLVMBasicBlockRef	saved_return_bb;
@@ -471,6 +463,7 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 	try_exit_bb = upl_append_block(ctx, "exc.try_exit");
 	exception_return_bb = upl_append_block(ctx, "exc.return");
 	handler_return_bb = upl_append_block(ctx, "exc.handler_return");
+	handler_exit_bb = upl_append_block(ctx, "exc.handler_exit");
 	after_block_bb = upl_append_block(ctx, "exc.after");
 	rethrow_bb = upl_append_block(ctx, "exc.rethrow");
 
@@ -517,7 +510,18 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 	saved_return_bb = ctx->return_bb;
 	ctx->return_bb = exception_return_bb;
 
+	/*
+	 * "EXIT <label>" out of the try body must still release the
+	 * subtransaction, so it targets try_exit_bb rather than jumping straight
+	 * to after_block_bb.
+	 */
+	if (stmt->label != NULL)
+		upl_push_block_label(ctx, stmt->label, try_exit_bb);
+
 	uplpgsql_compile_stmts(ctx, stmt->body);
+
+	if (stmt->label != NULL)
+		upl_pop_loop(ctx);
 
 	ctx->return_bb = saved_return_bb;
 
@@ -593,8 +597,18 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 			uplpgsql_call_fn(ctx, RT_EXCEPTION_SET_HANDLER_VARS, args, 3);
 		}
 
+		/*
+		 * "EXIT <label>" out of a handler body leaves the block, but must
+		 * run HANDLER_DONE on the way out.
+		 */
+		if (stmt->label != NULL)
+			upl_push_block_label(ctx, stmt->label, handler_exit_bb);
+
 		/* Compile the handler's statements */
 		uplpgsql_compile_stmts(ctx, exception->action);
+
+		if (stmt->label != NULL)
+			upl_pop_loop(ctx);
 
 		/* Clean up after handler (normal, non-RETURN completion) */
 		{
@@ -616,6 +630,14 @@ uplpgsql_compile_block_exceptions(UPL_compile_ctx *ctx, void *exception_data)
 		uplpgsql_call_fn(ctx, RT_EXCEPTION_HANDLER_DONE, args, 2);
 	}
 	LLVMBuildBr(ctx->builder, saved_return_bb);
+
+	/* === HANDLER EXIT (EXIT <label> inside a handler body) === */
+	LLVMPositionBuilderAtEnd(ctx->builder, handler_exit_bb);
+	{
+		LLVMValueRef args[] = { estate_ref, frame_ptr };
+		uplpgsql_call_fn(ctx, RT_EXCEPTION_HANDLER_DONE, args, 2);
+	}
+	LLVMBuildBr(ctx->builder, after_block_bb);
 
 	/* === RETHROW === */
 	LLVMPositionBuilderAtEnd(ctx->builder, rethrow_bb);
@@ -2183,15 +2205,42 @@ uplpgsql_compile_block(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_block *stmt)
 	 * uplpgsql_compile_block_exceptions(), which does its own init inside
 	 * the TRY — the core ignores n_initvars on that path.
 	 */
-	if (stmt->exceptions == NULL)
-		uplpgsql_emit_init_vars(ctx, stmt->n_initvars, stmt->initvarnos);
+	if (stmt->exceptions != NULL)
+	{
+		/*
+		 * The exception path pushes its own block label, because there an
+		 * EXIT must route through the subtransaction release rather than
+		 * branch past it.
+		 */
+		upl_emit_block(ctx, 0, NULL, stmt->body, true, stmt,
+					   uplpgsql_compile_block_exceptions);
+		return;
+	}
 
-	upl_emit_block(ctx,
-				   0, NULL,
-				   stmt->body,
-				   stmt->exceptions != NULL,
-				   stmt,
-				   uplpgsql_compile_block_exceptions);
+	uplpgsql_emit_init_vars(ctx, stmt->n_initvars, stmt->initvarnos);
+
+	/*
+	 * A labeled block is an EXIT target as well as a loop is: "EXIT <label>"
+	 * on a named block leaves the block and resumes after it.
+	 */
+	if (stmt->label != NULL)
+	{
+		LLVMBasicBlockRef end_bb = upl_append_block(ctx, "block.end");
+
+		upl_push_block_label(ctx, stmt->label, end_bb);
+
+		upl_emit_block(ctx, 0, NULL, stmt->body, false, stmt,
+					   uplpgsql_compile_block_exceptions);
+
+		upl_pop_loop(ctx);
+
+		if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(ctx->builder)) == NULL)
+			LLVMBuildBr(ctx->builder, end_bb);
+		LLVMPositionBuilderAtEnd(ctx->builder, end_bb);
+	}
+	else
+		upl_emit_block(ctx, 0, NULL, stmt->body, false, stmt,
+					   uplpgsql_compile_block_exceptions);
 }
 
 /*

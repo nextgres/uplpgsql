@@ -87,7 +87,30 @@ upl_push_loop(UPL_compile_ctx *ctx, const char *label,
 	UPL_loop_info *info = palloc(sizeof(UPL_loop_info));
 
 	info->label = label;
+	info->is_loop = true;
 	info->continue_bb = continue_bb;
+	info->exit_bb = exit_bb;
+	info->next = ctx->loop_stack;
+	ctx->loop_stack = info;
+}
+
+/*
+ * Push a labeled BEGIN...END block onto the tracking stack.
+ *
+ * A labeled block is a target for "EXIT <label>" but never for CONTINUE, so
+ * it carries no continue_bb.  exit_bb is where control resumes after the
+ * block; for a block with exception handlers it must be the path that still
+ * releases the subtransaction, not a jump past it.
+ */
+void
+upl_push_block_label(UPL_compile_ctx *ctx, const char *label,
+					 LLVMBasicBlockRef exit_bb)
+{
+	UPL_loop_info *info = palloc(sizeof(UPL_loop_info));
+
+	info->label = label;
+	info->is_loop = false;
+	info->continue_bb = NULL;
 	info->exit_bb = exit_bb;
 	info->next = ctx->loop_stack;
 	ctx->loop_stack = info;
@@ -118,7 +141,15 @@ upl_find_loop(UPL_compile_ctx *ctx, const char *label)
 	for (info = ctx->loop_stack; info != NULL; info = info->next)
 	{
 		if (label == NULL)
-			return info;			/* innermost loop */
+		{
+			/*
+			 * Unlabeled EXIT/CONTINUE targets the innermost real loop; a
+			 * labeled block enclosing it is not a match.
+			 */
+			if (info->is_loop)
+				return info;
+			continue;
+		}
 		if (info->label != NULL && strcmp(info->label, label) == 0)
 			return info;
 	}
@@ -595,6 +626,14 @@ upl_emit_loop_exit(UPL_compile_ctx *ctx, const char *label,
 	if (loop == NULL)
 		elog(ERROR, "upl: EXIT/CONTINUE outside of a loop");
 
+	/*
+	 * The parser already rejects CONTINUE naming a block label, so reaching
+	 * here with a non-loop target means the two got out of step.
+	 */
+	if (!is_exit && !loop->is_loop)
+		elog(ERROR, "upl: block label \"%s\" cannot be used in CONTINUE",
+			 label ? label : "");
+
 	target_bb = is_exit ? loop->exit_bb : loop->continue_bb;
 
 	if (cond_expr)
@@ -668,7 +707,15 @@ upl_emit_case(UPL_compile_ctx *ctx,
 		LLVMBasicBlockRef	when_else_bb;
 		LLVMValueRef		cond;
 
+		/*
+		 * A simple CASE's WHEN conditions read the test temporary, whose type
+		 * the driver settles at run time — so they must not be planned now.
+		 * Scoped to the condition: the WHEN bodies below are ordinary
+		 * statements and compile normally.
+		 */
+		ctx->defer_cond_plan = has_test_expr;
 		cond = upl_eval_bool(ctx, when_conds[i]);
+		ctx->defer_cond_plan = false;
 
 		when_then_bb = upl_append_block(ctx, "case.when.then");
 		when_else_bb = upl_append_block(ctx, "case.when.else");

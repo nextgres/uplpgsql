@@ -326,6 +326,9 @@ extern int32 uplpgsql_rt_eval_int(UPLpgSQL_exec_state *estate,
 								  UPLpgSQL_expr *expr);
 extern void uplpgsql_rt_assign_expr(UPLpgSQL_exec_state *estate,
 									int target_dno, UPLpgSQL_expr *expr);
+extern void uplpgsql_rt_case_assign_test(UPLpgSQL_exec_state *estate,
+										int t_varno,
+										UPLpgSQL_expr *t_expr);
 extern void uplpgsql_rt_init_var(UPLpgSQL_exec_state *estate, int dno);
 extern void uplpgsql_rt_set_found(UPLpgSQL_exec_state *estate, bool value);
 extern void uplpgsql_rt_assign_int(UPLpgSQL_exec_state *estate,

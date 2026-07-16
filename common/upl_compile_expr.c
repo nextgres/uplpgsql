@@ -4253,6 +4253,16 @@ uplpgsql_try_compile_bool(UPLpgSQL_compile_ctx *ctx,
 	ExprTypeClass	tc;
 	LLVMValueRef	estate_ref;
 
+	/*
+	 * Some conditions must not be planned at compile time — see
+	 * ctx->defer_cond_plan.  Decline before prepare_and_get_expr() so no plan
+	 * is built at all; the caller then emits the runtime evaluator, which
+	 * prepares the plan on first execution, by which point the operand types
+	 * are settled.
+	 */
+	if (ctx->defer_cond_plan)
+		return false;
+
 	expr = uplpgsql_prepare_and_get_expr(ctx, expr_node);
 	if (expr == NULL)
 		return false;

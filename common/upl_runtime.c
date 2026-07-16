@@ -213,6 +213,56 @@ uplpgsql_rt_assign_expr(UPLpgSQL_exec_state *estate,
 }
 
 /*
+ * uplpgsql_rt_case_assign_test - Evaluate a simple CASE's test expression into
+ * its temporary variable, retyping the variable to the expression's real type.
+ *
+ * The parser cannot know what type "CASE <expr> WHEN ..." tests, so it builds
+ * the temporary as an INT4 placeholder and leaves a note that the runtime will
+ * "fix this at runtime if needed" (upl_gram.y).  exec_stmt_case() does the
+ * fixing.  The JIT used to call exec_assign_expr() directly, which skips it and
+ * coerces the value to int4 instead:
+ *
+ *     DECLARE a text := 'x';
+ *     CASE a WHEN 'x' THEN ... END CASE;
+ *     ERROR:  invalid input syntax for type integer: "x"
+ *
+ * so a simple CASE worked only when the test expression really was an integer.
+ * Mirror exec_stmt_case().
+ */
+UPLPGSQL_RT_EXPORT void
+uplpgsql_rt_case_assign_test(UPLpgSQL_exec_state *estate, int t_varno,
+							 UPLpgSQL_expr *t_expr)
+{
+	UPLpgSQL_execstate *plstate = estate->uplpgsql_estate;
+	UPLpgSQL_var *t_var;
+	Datum		t_val;
+	bool		isnull;
+	Oid			t_typoid;
+	int32		t_typmod;
+
+	t_val = exec_eval_expr(plstate, t_expr, &isnull, &t_typoid, &t_typmod);
+
+	t_var = (UPLpgSQL_var *) plstate->datums[t_varno];
+
+	/*
+	 * When the expected datatype differs from the real one, change it.  This
+	 * modifies an execution copy of the datum, so it does not affect the
+	 * stored parse tree.
+	 */
+	if (t_var->datatype->typoid != t_typoid ||
+		t_var->datatype->atttypmod != t_typmod)
+		t_var->datatype = uplpgsql_build_datatype(t_typoid,
+												  t_typmod,
+												  plstate->func->fn_input_collation,
+												  NULL);
+
+	exec_assign_value(plstate, (UPLpgSQL_datum *) t_var, t_val, isnull,
+					  t_typoid, t_typmod);
+
+	exec_eval_cleanup(plstate);
+}
+
+/*
  * uplpgsql_rt_init_var - Initialize a variable with its default value.
  *
  * Must match exec_stmt_block()'s variable initialization logic exactly,
