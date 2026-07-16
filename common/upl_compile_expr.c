@@ -3258,6 +3258,54 @@ native_to_datum(UPLpgSQL_compile_ctx *ctx, LLVMValueRef val,
 }
 
 /*
+ * Datum conversion: i64 Datum → native value.  The inverse of
+ * native_to_datum(), for taking the result of a Tier 2 fmgr call back into
+ * native form.  Only the pass-by-value classes a native array can hold.
+ */
+static LLVMValueRef
+datum_to_native(UPLpgSQL_compile_ctx *ctx, LLVMValueRef datum,
+				ExprTypeClass type_class)
+{
+	LLVMBuilderRef builder = ctx->builder;
+
+	switch (type_class)
+	{
+		case EXPR_TYPE_INT4:
+			return LLVMBuildTrunc(builder, datum,
+								  ctx->types[UPLPGSQL_INT32], "datum.int4");
+		case EXPR_TYPE_INT8:
+			/* Already i64 */
+			return datum;
+		case EXPR_TYPE_FLOAT8:
+			return LLVMBuildBitCast(builder, datum,
+									ctx->types[UPLPGSQL_DOUBLE], "datum.f8");
+		default:
+			elog(ERROR, "uplpgsql: cannot convert Datum to type class %d",
+				 (int) type_class);
+			return NULL;
+	}
+}
+
+/*
+ * Map a native array's element type OID to its ExprTypeClass.
+ */
+static ExprTypeClass
+elemtype_to_class(Oid elemtype)
+{
+	switch (elemtype)
+	{
+		case INT4OID:
+			return EXPR_TYPE_INT4;
+		case INT8OID:
+			return EXPR_TYPE_INT8;
+		case FLOAT8OID:
+			return EXPR_TYPE_FLOAT8;
+		default:
+			return EXPR_TYPE_UNKNOWN;
+	}
+}
+
+/*
  * Map target type OID to ExprTypeClass.
  */
 static ExprTypeClass
@@ -3851,24 +3899,73 @@ not_native_init:
 					Expr		   *val_expr = sbsref->refassgnexpr;
 					ExprTypeClass	val_class;
 					LLVMValueRef	idx_val, val_result;
+					LLVMValueRef	val_isnull = NULL;
 					LLVMValueRef	data, len, idx0, gep;
 					LLVMValueRef	lb, in_range;
 					LLVMBasicBlockRef fast_bb, slow_bb, done_bb;
 					LLVMTypeRef		i32_ty = ctx->types[UPLPGSQL_INT32];
 
 					val_class = uplpgsql_classify_expr(val_expr);
-					if (val_class == EXPR_TYPE_UNKNOWN)
+
+					if (val_class != EXPR_TYPE_UNKNOWN)
+					{
+						elog(DEBUG1, "uplpgsql: native array set dno %d[idx]: %s",
+							 array_dno, stmt->expr->query);
+
+						idx_val = uplpgsql_compile_expr_datum(ctx, idx_expr,
+															  estate_ref,
+															  &idx_class);
+						val_result = uplpgsql_compile_expr_datum(ctx, val_expr,
+																estate_ref,
+																&val_class);
+
+						/*
+						 * Every Tier 1 operator is strict, so the value is
+						 * NULL exactly when one of its leaves is.
+						 */
+						val_isnull = tier1_expr_any_null(ctx, val_expr,
+														 estate_ref);
+					}
+					else if (uplpgsql_can_fmgr_compile(val_expr))
+					{
+						/*
+						 * Tier 2 value.  Tier 1 covers float8 arithmetic and
+						 * the float8 intrinsics, but not a cast down to the
+						 * element type — "a[i] := floor(x)::int" on an int[]
+						 * lands here.  Without this the whole statement went
+						 * to the interpreter, and because the target is a
+						 * native array the assign path then reloaded every
+						 * element from the Datum afterwards: O(n) per element
+						 * write, so filling an array was quadratic.
+						 *
+						 * The value's type is the array's element type — the
+						 * parser has already coerced refassgnexpr to it — so
+						 * take the class from there rather than from
+						 * classify_expr, which does not model the cast.
+						 */
+						val_class = elemtype_to_class(na->elemtype);
+						if (val_class == EXPR_TYPE_UNKNOWN)
+							goto standard_array_path;
+
+						elog(DEBUG1, "uplpgsql: native array set dno %d[idx] "
+							 "(fmgr bypass value): %s",
+							 array_dno, stmt->expr->query);
+
+						idx_val = uplpgsql_compile_expr_datum(ctx, idx_expr,
+															  estate_ref,
+															  &idx_class);
+						val_result = uplpgsql_compile_expr_fmgr_full(ctx,
+																	 val_expr,
+																	 estate_ref,
+																	 &val_isnull);
+						if (val_result == NULL)
+							goto standard_array_path;
+
+						val_result = datum_to_native(ctx, val_result,
+													 val_class);
+					}
+					else
 						goto standard_array_path;
-
-					elog(DEBUG1, "uplpgsql: native array set dno %d[idx]: %s",
-						 array_dno, stmt->expr->query);
-
-					idx_val = uplpgsql_compile_expr_datum(ctx, idx_expr,
-														  estate_ref,
-														  &idx_class);
-					val_result = uplpgsql_compile_expr_datum(ctx, val_expr,
-															estate_ref,
-															&val_class);
 
 					/*
 					 * A store into flat memory can only serve a subscript
@@ -3909,6 +4006,21 @@ not_native_init:
 								LLVMConstInt(i32_ty, 1, false), "na.last"),
 							"na.le.hi"),
 						"na.set.ok");
+
+					/*
+					 * A NULL value cannot go through the flat store: there
+					 * may be no null flags allocated to mark it in, and
+					 * storing the Datum would silently write a value where
+					 * PostgreSQL stores a NULL.  Send it to the slow path,
+					 * which hands the write to array_set_element with
+					 * valisnull set and re-reads the result.  Rare enough
+					 * that its cost does not matter.
+					 */
+					if (val_isnull != NULL)
+						in_range = LLVMBuildAnd(ctx->builder, in_range,
+							LLVMBuildNot(ctx->builder, val_isnull,
+										 "na.set.notnull"),
+							"na.set.ok.nn");
 
 					fast_bb = expr_append_block(ctx, "na.set.fast");
 					slow_bb = expr_append_block(ctx, "na.set.slow");
@@ -3980,8 +4092,9 @@ not_native_init:
 								LLVMConstInt(i32_ty, array_dno, false),
 								idx_val,
 								datum_val,
-								LLVMConstInt(ctx->types[UPLPGSQL_INT1], 0,
-											 false),	/* valisnull */
+								val_isnull != NULL ? val_isnull
+									: LLVMConstInt(ctx->types[UPLPGSQL_INT1],
+												   0, false),	/* valisnull */
 								ati.typlen_val,
 								ati.elemtype_val,
 								ati.elmlen_val,

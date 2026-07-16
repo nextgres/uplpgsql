@@ -534,3 +534,87 @@ drop function na_read_escape();
 drop function na_write_escape();
 drop function na_read_then_subscript();
 drop function na_round_trip();
+
+--
+-- Values written into a native array element.
+--
+-- Two things are being pinned here.
+--
+-- A NULL value must land as a NULL.  The flat store has nowhere to put one --
+-- there may be no null flags allocated at all -- so a NULL has to divert to
+-- array_set_element rather than write the Datum and clear the element's null
+-- flag, which silently turned "a[2] := <null>" into a[2] = 0.
+--
+-- And a value that needs a Tier 2 call, notably a cast down to the element
+-- type, must still take the flat store.  When it did not, the statement went
+-- to the interpreter, and because the target is a native array the assign path
+-- then reloaded every element from the Datum afterwards: O(n) per element
+-- write, so filling an array was quadratic in its length.
+--
+create function na_store_null() returns text language uplpgsql as $$
+declare a int[] := ARRAY[1,2,3]; b int; f float8[] := ARRAY[1,2,3]::float8[]; g float8;
+begin
+  a[2] := b;
+  f[2] := g;
+  return a::text || ' ' || f::text;
+end; $$;
+select na_store_null();
+
+-- a NULL write must not disturb its neighbours, and the slot must be
+-- readable as NULL afterwards
+create function na_store_null_read() returns text language uplpgsql as $$
+declare a int[] := ARRAY[1,2,3,4]; b int; r text;
+begin
+  a[2] := b;
+  a[4] := 9;
+  if a[2] is null then r := 'null'; else r := a[2]::text; end if;
+  return r || ' ' || a::text;
+end; $$;
+select na_store_null_read();
+
+-- NULL into a gap left by an extend
+create function na_store_null_extend() returns text language uplpgsql as $$
+declare a int[] := ARRAY[1,2]; b int;
+begin
+  a[5] := b;
+  a[4] := 4;
+  return a::text;
+end; $$;
+select na_store_null_extend();
+
+-- cast to the element type: int4 element fed from float8 arithmetic
+create function na_store_cast(n int) returns int[] language uplpgsql as $$
+declare a int[]; i int; v float8 := 2.0;
+begin
+  a := array_fill(0, ARRAY[n]);
+  for i in 1..n loop a[i] := floor(power(v, 0.45)*255.0 + 0.5)::int; end loop;
+  return a;
+end; $$;
+select na_store_cast(4);
+
+-- int8 element from a float8 expression, and a NULL through the same path
+create function na_store_cast_int8() returns bigint[] language uplpgsql as $$
+declare a bigint[] := ARRAY[0,0,0]::bigint[]; v float8 := 3.7; g float8;
+begin
+  a[1] := round(v)::bigint;
+  a[2] := g::bigint;
+  a[3] := (v*2)::bigint;
+  return a;
+end; $$;
+select na_store_cast_int8();
+
+-- the cast store must respect bounds too: out of range still extends
+create function na_store_cast_oob() returns int[] language uplpgsql as $$
+declare a int[] := ARRAY[1,2]; v float8 := 7.0;
+begin
+  a[5] := floor(v)::int;
+  return a;
+end; $$;
+select na_store_cast_oob();
+
+drop function na_store_null();
+drop function na_store_null_read();
+drop function na_store_null_extend();
+drop function na_store_cast(int);
+drop function na_store_cast_int8();
+drop function na_store_cast_oob();
