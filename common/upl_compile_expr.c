@@ -4518,19 +4518,14 @@ standard_array_path:
 	}
 
 	/*
-	 * Could not inline this expression.  Clear the plan we created at
-	 * compile time so that the runtime path (exec_assign_expr) can
-	 * re-prepare it with exec_simple_check_plan, enabling the fast
-	 * "simple expression" evaluation path.  Without this, expressions
-	 * that we SPI_prepare'd but couldn't inline would be stuck on the
-	 * slow full-SPI executor path (30x+ overhead).
+	 * Could not inline this expression.  The caller
+	 * (uplpgsql_compile_assign) clears the plan we created at compile time
+	 * so that the runtime path (exec_assign_expr) can re-prepare it with
+	 * exec_simple_check_plan, enabling the fast "simple expression"
+	 * evaluation path.  It cannot be cleared here: the caller first decides
+	 * which native arrays the fallback must marshal, and a surviving plan is
+	 * its evidence that paramnos reflects a completed parse analysis.
 	 */
-	if (stmt->expr->plan != NULL)
-	{
-		SPI_freeplan(stmt->expr->plan);
-		stmt->expr->plan = NULL;
-	}
-
 	return false;
 }
 

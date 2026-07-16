@@ -2397,6 +2397,18 @@ uplpgsql_sync_native_arrays(UPLpgSQL_compile_ctx *ctx)
  * paramnos is exactly the set of variables the expression reads, and it is
  * what escape analysis already trusts for RETURN/RAISE/FOREACH.  A NULL expr
  * means we cannot tell, so fall back to marshalling everything.
+ *
+ * paramnos is only trustworthy once the expression has been through parse
+ * analysis, which fills it in as each variable reference is resolved
+ * (make_datum_param).  Compilation runs before the function has ever
+ * executed, and the only expressions analyzed by then are the ones
+ * uplpgsql_try_compile_assign()/_bool() got as far as preparing.  An ASSIGN
+ * whose target is not a plain variable bails out before preparing, and a
+ * prepare that fails mid-analysis (a record field, say) leaves paramnos
+ * partially filled.  Either way expr->plan is still NULL — the plan is only
+ * set after a successful prepare — and a read-set taken from it would be
+ * empty or incomplete, baking a stale-array read into the compiled code for
+ * good.  Treat "no plan" as "read set unknown" and marshal everything.
  */
 static void
 uplpgsql_sync_native_arrays_for_expr(UPLpgSQL_compile_ctx *ctx,
@@ -2404,7 +2416,7 @@ uplpgsql_sync_native_arrays_for_expr(UPLpgSQL_compile_ctx *ctx,
 {
 	int		na_i;
 
-	if (expr == NULL)
+	if (expr == NULL || expr->plan == NULL)
 	{
 		uplpgsql_sync_native_arrays(ctx);
 		return;
@@ -2550,6 +2562,21 @@ uplpgsql_compile_assign(UPLpgSQL_compile_ctx *ctx, UPLpgSQL_stmt_assign *stmt)
 		uplpgsql_sync_native_arrays_for_expr(ctx, stmt->expr);
 		uplpgsql_call_exec_nosync(ctx, (void *) exec_assign_expr,
 								  ctx->types[UPLPGSQL_VOID], args, 3);
+
+		/*
+		 * Clear any plan created at compile time so that exec_assign_expr
+		 * can re-prepare it with exec_simple_check_plan, enabling the fast
+		 * "simple expression" evaluation path.  Without this, expressions
+		 * that were SPI_prepare'd but couldn't inline would be stuck on the
+		 * slow full-SPI executor path (30x+ overhead).  This must come after
+		 * the marshal decision above, which reads the plan as evidence that
+		 * paramnos reflects a completed parse analysis.
+		 */
+		if (stmt->expr->plan != NULL)
+		{
+			SPI_freeplan(stmt->expr->plan);
+			stmt->expr->plan = NULL;
+		}
 	}
 
 	/*
