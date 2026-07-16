@@ -683,3 +683,67 @@ drop function na_selective_sync();
 drop function na_selective_sync2();
 drop function na_selective_sync3();
 drop function na_selective_whole();
+
+-- a NULL leaf in the value of an element write stores a NULL element; every
+-- Tier 1 operator is strict, so the operator is never invoked and cannot
+-- raise on the NULL path
+create function na_nullleaf_div() returns text language uplpgsql as $$
+declare a int[] := array[1,2,3]; y int;
+begin
+  a[1] := 1 / y;
+  return a::text;
+end; $$;
+select na_nullleaf_div();
+
+create function na_nullleaf_ovf() returns text language uplpgsql as $$
+declare a int[] := array[1,2,3]; x int;
+begin
+  a[2] := x + 2147483647;
+  return a::text;
+end; $$;
+select na_nullleaf_ovf();
+
+-- float8 path: z / 0.0 with z NULL is NULL, not division_by_zero
+create function na_nullleaf_f8() returns text language uplpgsql as $$
+declare a float8[] := array[1.5,2.5]; z float8;
+begin
+  a[1] := z / 0.0;
+  return a::text;
+end; $$;
+select na_nullleaf_f8();
+
+-- a plain NULL store still works
+create function na_nullleaf_plain() returns text language uplpgsql as $$
+declare a int[] := array[1,2,3]; y int;
+begin
+  a[2] := y;
+  return a::text;
+end; $$;
+select na_nullleaf_plain();
+
+-- and a NULL value can extend the array: the gap and the target are NULL
+create function na_nullleaf_extend() returns text language uplpgsql as $$
+declare a int[] := array[1,2,3]; y int;
+begin
+  a[6] := 1 / y;
+  return a::text || ' len ' || array_length(a, 1)::text;
+end; $$;
+select na_nullleaf_extend();
+
+-- the standard (non-native) write path: an array parameter is never taken
+-- native, and used to store 0 for a NULL value with isnull hardwired false
+create function na_nullleaf_std(a int[]) returns text language uplpgsql as $$
+declare y int;
+begin
+  a[2] := y;
+  a[3] := 1 / y;
+  return a::text;
+end; $$;
+select na_nullleaf_std(array[1,2,3]);
+
+drop function na_nullleaf_div();
+drop function na_nullleaf_ovf();
+drop function na_nullleaf_f8();
+drop function na_nullleaf_plain();
+drop function na_nullleaf_extend();
+drop function na_nullleaf_std(int[]);

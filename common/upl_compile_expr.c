@@ -750,6 +750,76 @@ tier1_expr_any_null(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 }
 
 /*
+ * Compile a Tier 1 value expression, computing it only on the path where it
+ * is not NULL.
+ *
+ * Every Tier 1 operator is strict, so the expression is NULL exactly when one
+ * of its leaves is; *isnull_out receives that flag (from
+ * tier1_expr_any_null(), or NULL when nothing in the expression can be NULL).
+ * The arithmetic must not run on the NULL path: the division and overflow
+ * checks would raise on whatever garbage a NULL variable's datum happens to
+ * hold, where PostgreSQL never invokes the operator at all — "a[1] := 1 / y"
+ * with y NULL stores a NULL element, it does not raise division_by_zero.
+ *
+ * The scalar assignment path already branches this way (see
+ * uplpgsql_try_compile_assign); this is the same branch for value positions
+ * that consume the result as an SSA value rather than a store, so the NULL
+ * edge contributes a placeholder zero through a phi.  Every caller passes
+ * *isnull_out alongside the value, and nothing looks at the value when the
+ * flag is set.
+ */
+static LLVMValueRef
+tier1_compile_value_guarded(UPLpgSQL_compile_ctx *ctx, Expr *val_expr,
+							LLVMValueRef estate_ref,
+							ExprTypeClass *val_class,
+							LLVMValueRef *isnull_out)
+{
+	LLVMTypeRef			vty;
+	LLVMValueRef		computed, phi;
+	LLVMValueRef		vals[2];
+	LLVMBasicBlockRef	blocks[2];
+	LLVMBasicBlockRef	compute_bb, join_bb, from_bb;
+
+	*isnull_out = tier1_expr_any_null(ctx, val_expr, estate_ref);
+	if (*isnull_out == NULL)
+	{
+		/* Nothing nullable in it — compute unconditionally. */
+		return uplpgsql_compile_expr_datum(ctx, val_expr, estate_ref,
+										   val_class);
+	}
+
+	if (*val_class == EXPR_TYPE_FLOAT8)
+		vty = ctx->types[UPLPGSQL_DOUBLE];
+	else if (*val_class == EXPR_TYPE_INT8)
+		vty = ctx->types[UPLPGSQL_INT64];
+	else if (*val_class == EXPR_TYPE_BOOL)
+		vty = ctx->types[UPLPGSQL_INT1];
+	else
+		vty = ctx->types[UPLPGSQL_INT32];
+
+	compute_bb = expr_append_block(ctx, "t1.val.compute");
+	join_bb = expr_append_block(ctx, "t1.val.done");
+
+	from_bb = LLVMGetInsertBlock(ctx->builder);
+	LLVMBuildCondBr(ctx->builder, *isnull_out, join_bb, compute_bb);
+
+	LLVMPositionBuilderAtEnd(ctx->builder, compute_bb);
+	computed = uplpgsql_compile_expr_datum(ctx, val_expr, estate_ref,
+										   val_class);
+	vals[1] = computed;
+	blocks[1] = LLVMGetInsertBlock(ctx->builder);
+	LLVMBuildBr(ctx->builder, join_bb);
+
+	LLVMPositionBuilderAtEnd(ctx->builder, join_bb);
+	phi = LLVMBuildPhi(ctx->builder, vty, "t1.val");
+	vals[0] = LLVMConstNull(vty);
+	blocks[0] = from_bb;
+	LLVMAddIncoming(phi, vals, blocks, 2);
+
+	return phi;
+}
+
+/*
  * Emit IR to store a Datum (i64) into a variable.
  * Sets value, isnull=false, freeval=false.
  */
@@ -4100,16 +4170,19 @@ not_native_init:
 						idx_val = uplpgsql_compile_expr_datum(ctx, idx_expr,
 															  estate_ref,
 															  &idx_class);
-						val_result = uplpgsql_compile_expr_datum(ctx, val_expr,
-																estate_ref,
-																&val_class);
 
 						/*
 						 * Every Tier 1 operator is strict, so the value is
-						 * NULL exactly when one of its leaves is.
+						 * NULL exactly when one of its leaves is — and it
+						 * must then not be computed at all, or a division or
+						 * overflow check raises on garbage where PostgreSQL
+						 * stores a NULL element.  See
+						 * tier1_compile_value_guarded.
 						 */
-						val_isnull = tier1_expr_any_null(ctx, val_expr,
-														 estate_ref);
+						val_result = tier1_compile_value_guarded(ctx, val_expr,
+																 estate_ref,
+																 &val_class,
+																 &val_isnull);
 					}
 					else if (uplpgsql_can_fmgr_compile(val_expr))
 					{
@@ -4471,7 +4544,7 @@ standard_array_path:
 					if (val_class != EXPR_TYPE_UNKNOWN)
 					{
 						LLVMValueRef idx_val, val_result, val_datum;
-						LLVMValueRef isnull_false;
+						LLVMValueRef val_isnull;
 
 						elog(DEBUG1, "uplpgsql: array set dno %d[idx] := val: %s",
 							 array_dno, stmt->expr->query);
@@ -4479,12 +4552,21 @@ standard_array_path:
 						idx_val = uplpgsql_compile_expr_datum(ctx, idx_expr,
 															  estate_ref,
 															  &idx_class);
-						val_result = uplpgsql_compile_expr_datum(ctx, val_expr,
-																estate_ref,
-																&val_class);
+
+						/*
+						 * Same rule as the native write above: a NULL value
+						 * stores a NULL element and is never computed.
+						 * Hardwiring isnull to false here stored 0 where
+						 * PostgreSQL stores a NULL.
+						 */
+						val_result = tier1_compile_value_guarded(ctx, val_expr,
+																 estate_ref,
+																 &val_class,
+																 &val_isnull);
 						val_datum = native_to_datum(ctx, val_result, val_class);
-						isnull_false = LLVMConstInt(ctx->types[UPLPGSQL_INT1],
-													0, false);
+						if (val_isnull == NULL)
+							val_isnull = LLVMConstInt(ctx->types[UPLPGSQL_INT1],
+													  0, false);
 
 						{
 							ArrayTypeInfo ati;
@@ -4497,7 +4579,7 @@ standard_array_path:
 												 array_dno, false),
 									idx_val,
 									val_datum,
-									isnull_false,
+									val_isnull,
 									ati.typlen_val,
 									ati.elemtype_val,
 									ati.elmlen_val,
