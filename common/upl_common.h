@@ -166,6 +166,8 @@ typedef enum UPLpgSQL_rt_func
 	RT_FREE_VAR_DATUM,
 	RT_NATIVE_ARRAY_FROM_DATUM,
 	RT_NATIVE_ARRAY_TO_DATUM,
+	RT_NATIVE_ARRAY_RESERVE,
+	RT_NATIVE_ARRAY_RELEASE,
 	UPLPGSQL_NUM_RT_FUNCS
 } UPLpgSQL_rt_func;
 
@@ -290,6 +292,17 @@ typedef struct UPLpgSQL_native_array
 									 * PostgreSQL arrays need not start at 1
 									 * ('[2:3]={9,10}'), so subscripts are relative
 									 * to this, not to 1. */
+	LLVMValueRef	cap_ptr;		/* entry-block alloca: allocated element slots
+									 * in data.  An append (a write at exactly
+									 * lb+len) bumps len up to this without any
+									 * reallocation; past it the buffers grow
+									 * through uplpgsql_rt_native_array_reserve,
+									 * which doubles, so filling an array element
+									 * by element is amortized O(1) per write. */
+	LLVMValueRef	is_heap_ptr;	/* entry-block alloca (i8): 1 when data was
+									 * palloc'd and may be repalloc'd/pfree'd, 0
+									 * for the array_fill stack buffer, which can
+									 * only be copied out of. */
 } UPLpgSQL_native_array;
 
 /*
@@ -498,5 +511,13 @@ extern void uplpgsql_rt_native_array_to_datum(UPLpgSQL_exec_state *estate,
 											  int varno, void *data, int nelems,
 											  int lb, bool *nulls,
 											  Oid elemtype, int elem_size);
+/* Grow the flat buffers so at least len+1 elements fit (appends) */
+extern void uplpgsql_rt_native_array_reserve(UPLpgSQL_exec_state *estate,
+											 void **data_io, bool **nulls_io,
+											 int8 *is_heap_io, int32 *cap_io,
+											 int32 len, int32 elem_size);
+/* Free a native array's previous flat buffers before they are replaced */
+extern void uplpgsql_rt_native_array_release(void *data, bool *nulls,
+											 int8 is_heap);
 
 #endif							/* UPL_COMMON_H */

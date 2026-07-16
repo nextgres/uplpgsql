@@ -389,6 +389,25 @@ uplpgsql_setup_entry(UPL_compile_ctx *ctx)
 			LLVMBuildStore(ctx->builder,
 						   LLVMConstNull(ctx->types[UPLPGSQL_PTR]),
 						   na->nulls_ptr);
+
+			/*
+			 * Allocated capacity of data, in elements.  An append bumps len
+			 * up to this; past it the buffers grow through
+			 * uplpgsql_rt_native_array_reserve.
+			 */
+			snprintf(name, sizeof(name), "na%d.cap", na->dno);
+			na->cap_ptr = LLVMBuildAlloca(ctx->builder,
+										  ctx->types[UPLPGSQL_INT32], name);
+			LLVMBuildStore(ctx->builder, llvm_const_int32(ctx, 0),
+						   na->cap_ptr);
+
+			/* 1 when data was palloc'd; 0 for the array_fill stack buffer */
+			snprintf(name, sizeof(name), "na%d.onheap", na->dno);
+			na->is_heap_ptr = LLVMBuildAlloca(ctx->builder,
+											  ctx->types[UPLPGSQL_INT8], name);
+			LLVMBuildStore(ctx->builder,
+						   LLVMConstInt(ctx->types[UPLPGSQL_INT8], 0, false),
+						   na->is_heap_ptr);
 		}
 	}
 }
@@ -1189,6 +1208,8 @@ uplpgsql_analyze_native_arrays(UPLpgSQL_compile_ctx *ctx,
 			na->len_ptr = NULL;
 			na->lb_ptr = NULL;
 			na->nulls_ptr = NULL;
+			na->cap_ptr = NULL;
+			na->is_heap_ptr = NULL;
 
 			elog(DEBUG1, "uplpgsql: native array candidate dno %d (%s), "
 				 "elemtype %u, elem_size %d",
@@ -2078,6 +2099,34 @@ uplpgsql_register_runtime_funcs(UPLpgSQL_compile_ctx *ctx)
 		ctx->rt_funcs[RT_NATIVE_ARRAY_TO_DATUM] = LLVMAddFunction(ctx->module,
 			"uplpgsql_rt_native_array_to_datum", ft);
 	}
+
+	/*
+	 * void uplpgsql_rt_native_array_reserve(ptr estate, ptr data_io,
+	 *     ptr nulls_io, ptr is_heap_io, ptr cap_io, i32 len, i32 elem_size)
+	 *
+	 * The pointer arguments are the JIT'd code's own alloca slots: the
+	 * helper grows the buffers and writes the new pointers/capacity back
+	 * through them.
+	 */
+	{
+		LLVMTypeRef params[] = { ptr, ptr, ptr, ptr, ptr, i32, i32 };
+		LLVMTypeRef ft = LLVMFunctionType(vd, params, 7, false);
+
+		ctx->rt_fntypes[RT_NATIVE_ARRAY_RESERVE] = ft;
+		ctx->rt_funcs[RT_NATIVE_ARRAY_RESERVE] = LLVMAddFunction(ctx->module,
+			"uplpgsql_rt_native_array_reserve", ft);
+	}
+
+	/* void uplpgsql_rt_native_array_release(ptr data, ptr nulls, i8 is_heap) */
+	{
+		LLVMTypeRef i8t = ctx->types[UPLPGSQL_INT8];
+		LLVMTypeRef params[] = { ptr, ptr, i8t };
+		LLVMTypeRef ft = LLVMFunctionType(vd, params, 3, false);
+
+		ctx->rt_fntypes[RT_NATIVE_ARRAY_RELEASE] = ft;
+		ctx->rt_funcs[RT_NATIVE_ARRAY_RELEASE] = LLVMAddFunction(ctx->module,
+			"uplpgsql_rt_native_array_release", ft);
+	}
 }
 
 /*
@@ -2433,6 +2482,30 @@ uplpgsql_emit_refresh_native_array(UPLpgSQL_compile_ctx *ctx,
 									"na_nulls_out");
 	isnull_val = LLVMBuildZExt(ctx->builder, isnull_val, i32_ty, "isnull_i32");
 
+	/*
+	 * The mirror is being replaced wholesale, so release the old buffers
+	 * first — they have no other referent.  Without this every refresh
+	 * leaked the previous copy into datum_context, and a loop of
+	 * out-of-range writes (each one a sync/set/refresh round trip)
+	 * accumulated O(n^2) bytes over the call.  The array_fill stack buffer
+	 * is skipped via the is_heap flag.
+	 */
+	{
+		LLVMValueRef rel_args[3];
+
+		rel_args[0] = LLVMBuildLoad2(ctx->builder, ctx->types[UPLPGSQL_PTR],
+									 na->data_ptr, "na.old_data");
+		rel_args[1] = LLVMBuildLoad2(ctx->builder, ctx->types[UPLPGSQL_PTR],
+									 na->nulls_ptr, "na.old_nulls");
+		rel_args[2] = LLVMBuildLoad2(ctx->builder, ctx->types[UPLPGSQL_INT8],
+									 na->is_heap_ptr, "na.old_onheap");
+
+		LLVMBuildCall2(ctx->builder,
+			ctx->rt_fntypes[RT_NATIVE_ARRAY_RELEASE],
+			ctx->rt_funcs[RT_NATIVE_ARRAY_RELEASE],
+			rel_args, 3, "");
+	}
+
 	{
 		LLVMValueRef call_args[] = {
 			estate_ref,
@@ -2458,6 +2531,17 @@ uplpgsql_emit_refresh_native_array(UPLpgSQL_compile_ctx *ctx,
 	new_nulls = LLVMBuildLoad2(ctx->builder, ctx->types[UPLPGSQL_PTR],
 							   nulls_out_ptr, "na.new_nulls");
 	LLVMBuildStore(ctx->builder, new_nulls, na->nulls_ptr);
+
+	/*
+	 * from_datum allocates exactly len elements, on the heap.  (len can be 0
+	 * or -1 with a NULL data pointer; the capacity is never consulted then,
+	 * because the append test requires len >= 0 and a reserve call fixes the
+	 * buffers up before anything is stored.)
+	 */
+	LLVMBuildStore(ctx->builder, new_len, na->cap_ptr);
+	LLVMBuildStore(ctx->builder,
+				   LLVMConstInt(ctx->types[UPLPGSQL_INT8], 1, false),
+				   na->is_heap_ptr);
 }
 
 static void
