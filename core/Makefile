@@ -16,15 +16,21 @@ CC ?= cc
 # -fPIC: these objects are archived into a static library that is linked
 # into the driver's shared object; ELF platforms require
 # position-independent code for that.  A no-op on macOS.
+#
+# -MMD -MP: let the compiler record which headers each object actually
+# included, into a .d file we read back below.  A hand-written header list
+# goes stale silently — it rebuilds nothing when a header it forgot changes,
+# and the result is testing a binary that does not match the source.
 CFLAGS = -Wall -Wmissing-prototypes -Wpointer-arith \
 	-Wdeclaration-after-statement -Werror=vla \
 	-Wendif-labels -Wmissing-format-attribute \
 	-Wformat-security -fno-strict-aliasing -fwrapv \
-	-fvisibility=hidden -fPIC -O2 \
+	-fvisibility=hidden -fPIC -O2 -MMD -MP \
 	-I$(PG_INCLUDEDIR_SERVER) \
 	$(UPL_LLVM_CFLAGS)
 
 OBJS = upl_llvm.o upl_cache.o upl_compile.o upl_datum.o
+DEPS = $(OBJS:.o=.d)
 
 LIB = libupl_core.a
 
@@ -33,10 +39,13 @@ LIB = libupl_core.a
 all: $(LIB)
 
 $(LIB): $(OBJS)
+	rm -f $@
 	ar rcs $@ $^
 
-%.o: %.c upl.h
+%.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(LIB)
+	rm -f $(OBJS) $(DEPS) $(LIB)
+
+-include $(DEPS)
