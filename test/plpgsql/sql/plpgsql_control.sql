@@ -502,11 +502,131 @@ end; $$;
 truncate exitblk_t;
 select exit_handler_cross_try();
 
+-- EXIT of an outer block label from inside a FOR-over-rows loop must close
+-- the loop's portal on the way out; a pinned portal left behind makes the
+-- surrounding transaction unable to commit ("cannot commit while a portal is
+-- pinned"), so an unfixed build errors on this very statement
+create function exit_portal_cross() returns int language uplpgsql as $$
+declare r record; n int := 0;
+begin
+  <<outer>> begin
+    for r in select g from generate_series(1, 5) g loop
+      n := n + r.g;
+      exit outer;
+    end loop;
+    n := -99;
+  end;
+  return n;
+end; $$;
+select exit_portal_cross();
+
+-- CONTINUE of an outer loop from inside an inner FOR-over-rows closes the
+-- inner portal each time it fires
+create function continue_portal_cross() returns int language uplpgsql as $$
+declare r record; n int := 0;
+begin
+  <<top>> for i in 1..3 loop
+    for r in select g from generate_series(1, 5) g loop
+      n := n + 1;
+      continue top;
+    end loop;
+    n := n + 1000;
+  end loop;
+  return n;
+end; $$;
+select continue_portal_cross();
+
+-- EXIT crossing both a FOR-over-rows portal and an enclosing exception frame:
+-- the portal closes and the subtransaction commits, innermost first
+create function exit_portal_and_frame() returns int language uplpgsql as $$
+declare r record; n int := 0;
+begin
+  <<outer>> begin
+    begin
+      for r in select g from generate_series(1, 5) g loop
+        insert into exitblk_t values (r.g);
+        exit outer;
+      end loop;
+    exception when others then n := 99;
+    end;
+    n := 50;
+  end;
+  return n + (select count(*)::int from exitblk_t);
+end; $$;
+truncate exitblk_t;
+select exit_portal_and_frame();
+
+-- EXIT crossing two nested FOR-over-rows loops closes both portals
+create function exit_two_portals() returns int language uplpgsql as $$
+declare a record; b record; n int := 0;
+begin
+  <<outer>> begin
+    for a in select g from generate_series(1, 3) g loop
+      for b in select g from generate_series(1, 3) g loop
+        n := n + 1;
+        exit outer;
+      end loop;
+      n := n + 1000;
+    end loop;
+    n := n + 100000;
+  end;
+  return n;
+end; $$;
+select exit_two_portals();
+
+-- a bound cursor FOR loop (FORC) holds a portal too; EXIT crossing it must
+-- close the cursor
+create function exit_forc_cross() returns int language uplpgsql as $$
+declare
+  cur cursor for select g from generate_series(1, 5) g;
+  r record;
+  n int := 0;
+begin
+  <<outer>> begin
+    for r in cur loop
+      n := n + r.g;
+      exit outer;
+    end loop;
+    n := -99;
+  end;
+  return n;
+end; $$;
+select exit_forc_cross();
+
+-- FOR ... IN EXECUTE (dynamic query, DYNFORS) holds a portal; EXIT crossing
+-- it closes it
+create function exit_dynfors_cross() returns int language uplpgsql as $$
+declare r record; n int := 0;
+begin
+  <<outer>> begin
+    for r in execute 'select g from generate_series(1, 5) g' loop
+      n := n + r.g;
+      exit outer;
+    end loop;
+    n := -99;
+  end;
+  return n;
+end; $$;
+select exit_dynfors_cross();
+
+-- a FOR-over-rows loop that exits normally still closes its portal (baseline)
+create function fors_normal_exit() returns int language uplpgsql as $$
+declare r record; n int := 0;
+begin
+  for r in select g from generate_series(1, 4) g loop
+    n := n + r.g;
+  end loop;
+  return n;
+end; $$;
+select fors_normal_exit();
+
 -- the session's transaction state is sane after all of the above: an
 -- explicit transaction block opens and closes cleanly (a leaked
--- subtransaction would warn on BEGIN and abort on ROLLBACK)
+-- subtransaction would warn on BEGIN and abort on ROLLBACK), and no portal
+-- was left pinned
 begin;
 select 1 as sanity;
+select count(*)::int as open_portals from pg_cursors;
 rollback;
 
 -- and a trapped error still traps
@@ -536,6 +656,13 @@ drop function exit_outer_cross_exc();
 drop function continue_from_handler(int);
 drop function exit_cross_two_frames();
 drop function exit_handler_cross_try();
+drop function exit_portal_cross();
+drop function continue_portal_cross();
+drop function exit_portal_and_frame();
+drop function exit_two_portals();
+drop function exit_forc_cross();
+drop function exit_dynfors_cross();
+drop function fors_normal_exit();
 drop function exc_still_works_after_crossing();
 drop table exitblk_t;
 
