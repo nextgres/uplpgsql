@@ -63,8 +63,8 @@ s := s + 1.0/(i*i);        -- numeric division, whatever s is declared as
 s := s + 1.0::float8/(i*i)::float8;   -- float8
 ```
 
-are different workloads. The first is the 1.3x row; the second is the 21.8x
-row. Both appear above under their real names.
+are different workloads. The first is the "numeric arithmetic" row; the second
+is the "float8 arithmetic" row. Both appear above under their real names.
 
 **Array element writes are the lowest-ratio compiled row, and the reason is
 the value expression, not the store.** Separating the two halves:
