@@ -21,7 +21,7 @@
 
 set -uo pipefail
 
-DB="${DB:-plxbench}"
+DB="${DB:-bench}"
 PSQL="psql -X ${PSQL_CONN:-} -d $DB"
 RUNS="${RUNS:-5}"
 

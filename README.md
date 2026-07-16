@@ -47,7 +47,7 @@ A driver owns its parser, its AST, and its interpreter fallback. It reaches the 
 
 | Front-end | Status |
 |-----------|--------|
-| PL/pgSQL  | Working. Tracks PostgreSQL 20devel; 14/14 regression tests pass. |
+| PL/pgSQL  | Working. Tracks PostgreSQL 20devel; 15/15 regression tests pass. |
 | SQL/PSM   | Removed. Adds `SIGNAL`/`RESIGNAL`, `REPEAT`, `DECLARE HANDLER`. |
 | PL/SQL    | Removed. Adds packages, nested subprograms, collections. |
 | T-SQL     | Removed. Adds `TRY`/`CATCH`, `GOTO`, `RAISERROR`. |
@@ -56,7 +56,7 @@ Only the PL/pgSQL driver lives in this tree today.
 
 ## Building
 
-Requires PostgreSQL 20devel and LLVM 15+, and is developed/tested against LLVM 22. The build is C only and uses the LLVM C API only.
+Requires PostgreSQL 18 or later (18 builds via compatibility shims in `common/upl_plpgsql.h`; development tracks 20devel) and LLVM 15+, and is developed/tested against LLVM 22. The build is C only and uses the LLVM C API only.
 
 PostgreSQL does **not** need to be built `--with-llvm`. `uplpgsql` links its own LLVM and owns its LLJIT instance; it never touches PostgreSQL's `llvmjit` provider. A stock server with no JIT support of its own runs JIT-compiled PL/pgSQL just fine.
 
@@ -65,7 +65,7 @@ make install
 make installcheck
 ```
 
-PGXS does not track header dependencies. After editing anything in `core/` or `common/`, run `make clean && make install` — a stale object file with the old struct layout will not fail to link, it will fail at runtime.
+Header dependencies are tracked (`-MMD`), so an incremental `make install` rebuilds and ships everything a source or header edit touches. Two caveats. A tree last built before dependency tracking was added has no `.d` files yet and needs one `make clean` to arm it. And under a PostgreSQL built `--with-llvm`, PGXS's bitcode (`.bc`) rule has no dependency tracking of its own, so after header edits the installed bitcode can go stale even though the `.so` is fresh — run `make clean && make install` in that configuration.
 
 ## License
 

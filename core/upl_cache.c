@@ -141,7 +141,7 @@ upl_cache_lookup(Oid fn_oid, TransactionId fn_xmin, ItemPointerData fn_tid,
 		!ItemPointerEquals(&entry->fn_tid, &fn_tid) ||
 		(check_fn && !check_fn(entry->lang_func, current_lang_func)))
 	{
-		elog(LOG, "upl: invalidating cache for function %u "
+		elog(DEBUG1, "upl: invalidating cache for function %u "
 			 "(xmin %u -> %u, lang_func %p -> %p)",
 			 fn_oid,
 			 entry->fn_xmin, fn_xmin,
