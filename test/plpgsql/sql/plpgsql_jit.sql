@@ -773,3 +773,18 @@ DROP FUNCTION jit_trigger_stmt();
 
 -- Cleanup
 DROP TABLE jit_trigger_test;
+
+-- A compile-time failure must fall back to the interpreter silently: the
+-- constant fold of ('1e400'::numeric)::float8 raises "out of range" while
+-- compiling, but the branch is never taken and the function returns 2.5.
+-- The failure belongs on the server log, not the client -- an unfixed build
+-- emitted a spurious ERROR to the client alongside the real result.
+CREATE FUNCTION jit_compile_fallback() RETURNS float8 AS $$
+DECLARE x float8;
+BEGIN
+  IF false THEN x := ('1e400'::numeric)::float8 + 0.0; END IF;
+  RETURN 2.5;
+END
+$$ LANGUAGE uplpgsql;
+SELECT jit_compile_fallback();
+DROP FUNCTION jit_compile_fallback();
