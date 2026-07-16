@@ -44,7 +44,7 @@ Ratios are the point of comparison; absolute times are machine-specific.
 | int8 arithmetic            |  755.4 |  92.7 |  8.1x |
 | numeric arithmetic         |  493.9 | 386.1 |  1.3x |
 | array element writes       |   25.0 |  31.7 |  0.8x |
-| Cornell box path tracer    | 2073.9 | 231.8 |  8.9x |
+| Cornell box path tracer    | 43953.9 | 3010.7 | 14.6x |
 
 All workloads returned identical values under both engines.
 
@@ -88,9 +88,11 @@ float8 throughout, a scene held in arrays read once per sphere per bounce,
 nested loops, branches, a shadow ray cast toward the light at every diffuse
 bounce (next-event estimation), and a deterministic image that both engines
 must agree on pixel for pixel. It is the workload that has found the most bugs
-— the quadratic array write, the whole-array marshal on fallback, and the
-Tier 2 gap above were all first seen here. The row is measured at 48x48, 8
-samples per pixel.
+— the quadratic array write, the whole-array marshal on fallback, the Tier 2
+gap above, and a per-call float8(numeric) memory leak were all first seen here.
+The row is measured at 64x64, 100 samples per pixel; the ratio rises with the
+sample count, since more samples spend proportionally more time in the loop
+arithmetic the JIT compiles and less in fixed per-call overhead.
 
 ## Reproduction
 
