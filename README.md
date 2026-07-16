@@ -11,6 +11,14 @@ A JIT-compiling PL/pgSQL for Postgres, derived from the NEXTGRES Universal Proce
 
 Just `CREATE EXTENSION uplpgsql;` and replace `LANGUAGE plpgsql` with `LANGUAGE uplpgsql`.
 
+## Why you would use it
+
+We've long believed in the [Thick Database approach](https://www.youtube.com/watch?v=8jiJDflpw4Y), and putting logic where the data lives; it's fewer round trips, transactional integrity by construction, and a service written in a fraction of the code C would take. That's why much of the [NEXTGRES personalization system](https://nextgres.ai/) is written directly inside the database using PL/SQL. But interpreted procedural languages are often slow and resource hungry. We saw this first-hand, working on many Oracle-to-Postgres migrations, which encountered slower execution times and increased resource utilization. A PL compiler skips that, with the same source at nearly-native speed.
+
+While our services are primarily developed in PL/SQL, our internal compiler also supports PL/pgSQL, SQL/PSM, and T-SQL. We felt it's about time normal Postgres users get some of the same performance benefits, and began rebuilding the compiler using a modern, JIT-oriented approach.
+
+If you have procedural code, want better response times, and lower overhead, this is intended for you.
+
 ## How it differs from PL/pgSQL
 
 PostgreSQL's PL/pgSQL is a tree-walking interpreter. Every `IF`, every loop iteration, every assignment costs a switch dispatch and a recursive call through `exec_stmt`. PostgreSQL's own JIT does not help: it compiles SQL expressions and tuple deforming, not procedural control flow.  `uplpgsql` compiles the control flow itself. Statements become LLVM basic blocks and branches; loops become real loops; variable access becomes a load from a computed struct offset. Compiled functions are cached per backend and invalidated on `fn_xmin`/`fn_tid` change, so a `CREATE OR REPLACE` recompiles and nothing stale survives.
