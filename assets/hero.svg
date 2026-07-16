@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="470" viewBox="0 0 1200 470" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" role="img" aria-label="uplpgsql — PL/pgSQL compiled to native machine code, 9 to 23 times faster than the interpreter">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0e1626"/>
+      <stop offset="1" stop-color="#0a111e"/>
+    </linearGradient>
+    <linearGradient id="stat" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd79a"/>
+      <stop offset="1" stop-color="#ff9d33"/>
+    </linearGradient>
+    <linearGradient id="bar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#8a4e18"/>
+      <stop offset="1" stop-color="#ffb454"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ff9d33" stop-opacity="0.20"/>
+      <stop offset="1" stop-color="#ff9d33" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="1" fill="#ffffff" fill-opacity="0.035"/>
+    </pattern>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDev="9"/>
+    </filter>
+    <clipPath id="cardclip">
+      <rect x="56" y="196" width="452" height="112" rx="11"/>
+    </clipPath>
+    <clipPath id="frame">
+      <rect x="8" y="8" width="1184" height="454" rx="20"/>
+    </clipPath>
+  </defs>
+
+  <!-- ground -->
+  <rect x="8" y="8" width="1184" height="454" rx="20" fill="url(#bg)" stroke="#ffffff" stroke-opacity="0.08"/>
+  <g clip-path="url(#frame)">
+    <rect x="8" y="8" width="1184" height="454" fill="url(#dots)"/>
+    <ellipse cx="880" cy="180" rx="300" ry="220" fill="url(#glow)"/>
+  </g>
+
+  <!-- column divider -->
+  <line x1="676" y1="70" x2="676" y2="400" stroke="#ffffff" stroke-opacity="0.09"/>
+
+  <!-- ===== LEFT: identity + the swap ===== -->
+  <text x="57" y="78" font-size="12.5" letter-spacing="3.2" font-weight="600" fill="#ff9d33" fill-opacity="0.85">POSTGRES PROCEDURAL LANGUAGE, COMPILED</text>
+
+  <text x="55" y="132" font-family="ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace" font-size="63" font-weight="700" letter-spacing="-1">
+    <tspan fill="#ffb454">upl</tspan><tspan fill="#dfe7f1">pgsql</tspan>
+  </text>
+
+  <text x="57" y="170" font-size="20.5" fill="#93a1b5">PL/pgSQL, compiled to native machine code.</text>
+
+  <!-- diff card: the one-word migration -->
+  <rect x="56" y="196" width="452" height="112" rx="11" fill="#0c1523" stroke="#ffffff" stroke-opacity="0.07"/>
+  <g clip-path="url(#cardclip)" font-family="ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace" font-size="21">
+    <rect x="56" y="196" width="452" height="56" fill="#f85149" fill-opacity="0.09"/>
+    <rect x="56" y="252" width="452" height="56" fill="#3fb950" fill-opacity="0.11"/>
+    <line x1="96" y1="196" x2="96" y2="308" stroke="#ffffff" stroke-opacity="0.06"/>
+    <text x="72" y="231" fill="#f85149" font-weight="700">&#8722;</text>
+    <text x="112" y="231" fill="#e39a9a">CREATE FUNCTION f() &#8230; LANGUAGE <tspan fill="#f2b8b8" font-weight="700">plpgsql</tspan></text>
+    <text x="72" y="287" fill="#3fb950" font-weight="700">+</text>
+    <text x="112" y="287" fill="#8fd39a">CREATE FUNCTION f() &#8230; LANGUAGE <tspan fill="#b7ecbe" font-weight="700">uplpgsql</tspan></text>
+  </g>
+
+  <text x="57" y="348" font-size="15.5" fill="#8492a6">One&#8209;word edit &#8212; same grammar, same semantics, same error messages.</text>
+
+  <text x="57" y="392" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="12.5" letter-spacing="1.6" fill="#5d6b7e">LLVM ORCJIT<tspan fill="#3a475a">&#160;&#160;&#183;&#160;&#160;</tspan>THREE&#8209;TIER EXPRESSIONS<tspan fill="#3a475a">&#160;&#160;&#183;&#160;&#160;</tspan>CACHED PER BACKEND</text>
+
+  <!-- ===== RIGHT: the claim + the evidence ===== -->
+  <text x="712" y="112" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="13" letter-spacing="2.4" fill="#93a1b5">INTERPRETED<tspan fill="#ffb454" font-weight="700">&#160;&#160;&#8594;&#160;&#160;</tspan>JIT&#8209;COMPILED</text>
+
+  <!-- glow copy + crisp stat -->
+  <text x="710" y="198" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="90" font-weight="700" fill="#ff9d33" filter="url(#soft)" opacity="0.55">9&#8211;23&#215;</text>
+  <text x="710" y="198" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="90" font-weight="700" fill="url(#stat)">9&#8211;23&#215;</text>
+  <text x="714" y="230" font-size="17" fill="#93a1b5">faster on compiled workloads</text>
+
+  <!-- evidence bars: real ratios, 9 workloads, sorted -->
+  <g font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="12.5" fill="#ffcf9a">
+    <rect x="712" y="258" width="380" height="11" rx="2.5" fill="url(#bar)"/><text x="1100" y="267.5">23.0&#215;</text>
+    <rect x="712" y="278" width="358" height="11" rx="2.5" fill="url(#bar)"/><text x="1078" y="287.5">21.7&#215;</text>
+    <rect x="712" y="298" width="274" height="11" rx="2.5" fill="url(#bar)"/><text x="994" y="307.5">16.6&#215;</text>
+    <rect x="712" y="318" width="251" height="11" rx="2.5" fill="url(#bar)"/><text x="971" y="327.5">15.2&#215;</text>
+    <rect x="712" y="338" width="243" height="11" rx="2.5" fill="url(#bar)"/><text x="963" y="347.5">14.7&#215;</text>
+    <rect x="712" y="358" width="215" height="11" rx="2.5" fill="url(#bar)"/><text x="935" y="367.5">13.0&#215;</text>
+    <rect x="712" y="378" width="149" height="11" rx="2.5" fill="url(#bar)"/><text x="869" y="387.5">9.0&#215;</text>
+    <rect x="712" y="398" width="83" height="11" rx="2.5" fill="url(#bar)"/><text x="803" y="407.5">5.0&#215;</text>
+    <rect x="712" y="418" width="23" height="11" rx="2.5" fill="url(#bar)" fill-opacity="0.7"/><text x="743" y="427.5" fill="#8492a6">1.4&#215;</text>
+  </g>
+  <text x="712" y="450" font-size="12.5" fill="#5d6b7e">9 workloads vs. PostgreSQL&#8217;s PL/pgSQL interpreter &#8212; Mandelbrot down to numeric</text>
+</svg>
