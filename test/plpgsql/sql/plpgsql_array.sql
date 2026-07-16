@@ -321,6 +321,133 @@ select na_forc_escape();
 drop function na_fors_escape();
 drop function na_dynfors_escape();
 drop function na_forc_escape();
+--
+-- PostgreSQL array semantics on the native path.
+--
+-- A native array is flat memory, but PostgreSQL arrays are not fixed-size
+-- vectors: a subscript outside the bounds reads as NULL rather than raising,
+-- an assignment outside the bounds *extends* the array (filling the gap with
+-- NULLs), the lower bound need not be 1, and a single subscript on a
+-- multi-dimensional value is NULL.  The native path has to reproduce all of
+-- it, so the fast in-bounds store is guarded and everything else defers to
+-- array_set_element.
+--
+
+-- out-of-bounds reads are NULL, not an error
+create or replace function na_oob_read() returns text language uplpgsql as $$
+declare a int[]; begin
+  a := array_fill(1, array[3]);
+  return coalesce(a[10]::text,'N') || '/' || coalesce(a[0]::text,'N') || '/'
+         || coalesce(a[-1]::text,'N');
+end; $$;
+select na_oob_read();
+
+create or replace function na_null_read() returns text language uplpgsql as $$
+declare a int[]; r int; begin r := a[1]; return coalesce(r::text,'NULL'); end; $$;
+select na_null_read();
+
+-- an out-of-bounds write extends, leaving NULLs in the gap
+create or replace function na_oob_write() returns text language uplpgsql as $$
+declare a int[]; begin
+  a := array_fill(1, array[3]);
+  a[6] := 9;
+  return array_dims(a) || ' ' || a[6] || ' gap=' || coalesce(a[4]::text,'NULL')
+         || ' kept=' || a[2];
+end; $$;
+select na_oob_write();
+
+-- filling a gap clears that element's NULL flag
+create or replace function na_fill_gap() returns text language uplpgsql as $$
+declare a int[]; begin
+  a := array_fill(1, array[3]);
+  a[6] := 9;
+  a[4] := 4;
+  return a[4]::text || '/' || a[6]::text;
+end; $$;
+select na_fill_gap();
+
+-- an array grown only by subscript assignment, never sized up front
+create or replace function na_grow() returns text language uplpgsql as $$
+declare a int[]; i int; s bigint := 0; begin
+  for i in 1..5 loop a[i] := i*i; end loop;
+  for i in 1..5 loop s := s + a[i]; end loop;
+  return s::text || ' ' || array_dims(a);
+end; $$;
+select na_grow();
+
+create or replace function na_grow_null_default() returns text language uplpgsql as $$
+declare a int[] := NULL; begin a[1] := 7; return a[1]::text; end; $$;
+select na_grow_null_default();
+
+-- writing to a NULL array bases it at the subscript used
+create or replace function na_write_null_arr() returns text language uplpgsql as $$
+declare a int[]; begin a[3] := 7; return array_dims(a) || ' ' || a[3]; end; $$;
+select na_write_null_arr();
+
+-- a lower bound other than 1 is honoured on read, and on extend
+create or replace function na_lb_read() returns text language uplpgsql as $$
+declare a int[] := '[2:3]={9,10}'::int[]; begin
+  return coalesce(a[2]::text,'N') || '/' || coalesce(a[1]::text,'N');
+end; $$;
+select na_lb_read();
+
+create or replace function na_lb_extend() returns text language uplpgsql as $$
+declare a int[] := '[2:3]={9,10}'::int[]; begin
+  a[5] := 1;
+  return array_dims(a) || '/' || a[5];
+end; $$;
+select na_lb_extend();
+
+-- a single subscript on a multi-dimensional value is NULL, and the value
+-- itself must survive the round trip unflattened
+create or replace function na_2d_single() returns text language uplpgsql as $$
+declare a int[] := array[[1,2],[3,4]]; r int; begin
+  r := a[1];
+  return coalesce(r::text,'NULL') || '/' || array_dims(a) || '/' || a[1][2];
+end; $$;
+select na_2d_single();
+
+-- int8 and float8 elements take the same paths
+create or replace function na_int8_grow() returns text language uplpgsql as $$
+declare a bigint[]; begin
+  a := array_fill(5::bigint, array[3]);
+  a[5] := 7;
+  return a[5]::text || '/' || coalesce(a[4]::text,'N');
+end; $$;
+select na_int8_grow();
+
+create or replace function na_float8_grow() returns text language uplpgsql as $$
+declare a float8[]; begin
+  a := array_fill(1.5::float8, array[2]);
+  a[4] := 2.5;
+  return a[4]::text || '/' || coalesce(a[3]::text,'N');
+end; $$;
+select na_float8_grow();
+
+-- the fast in-bounds path itself
+create or replace function na_fast_path() returns text language uplpgsql as $$
+declare x int[]; t bigint := 0; i int; begin
+  x := array_fill(2, array[100]);
+  x[50] := 3;
+  for i in 1..100 loop t := t + x[i]; end loop;
+  return t::text;
+end; $$;
+select na_fast_path();
+
+drop function na_oob_read();
+drop function na_null_read();
+drop function na_oob_write();
+drop function na_fill_gap();
+drop function na_grow();
+drop function na_grow_null_default();
+drop function na_write_null_arr();
+drop function na_lb_read();
+drop function na_lb_extend();
+drop function na_2d_single();
+drop function na_int8_grow();
+drop function na_float8_grow();
+drop function na_fast_path();
+
 -- a native array initialised by a DECLARE default.  init_var evaluates the
 -- default into the variable's PG Datum; flat memory must be reloaded from it,
 -- or native subscripts bounds-check against a length of zero.

@@ -511,6 +511,53 @@ uplpgsql_emit_load_param_isnull(UPLpgSQL_compile_ctx *ctx,
 }
 
 /*
+ * Emit a test for "element idx of this native array is NULL".
+ *
+ * nulls_ptr holds either a per-element bool array or NULL when no element is
+ * null, so the flags load has to be guarded.  Returns an i1.
+ */
+static LLVMValueRef
+emit_native_array_elem_isnull(UPLpgSQL_compile_ctx *ctx,
+							  UPLpgSQL_native_array *na, LLVMValueRef idx0)
+{
+	LLVMBuilderRef		builder = ctx->builder;
+	LLVMTypeRef			i8 = ctx->types[UPLPGSQL_INT8];
+	LLVMTypeRef			i1 = ctx->types[UPLPGSQL_INT1];
+	LLVMValueRef		nulls, has_nulls, gep, flag, phi;
+	LLVMValueRef		vals[2];
+	LLVMBasicBlockRef	blocks[2];
+	LLVMBasicBlockRef	load_bb, done_bb, from_bb;
+
+	nulls = LLVMBuildLoad2(builder, ctx->types[UPLPGSQL_PTR],
+						   na->nulls_ptr, "na.nulls");
+	has_nulls = LLVMBuildICmp(builder, LLVMIntNE, nulls,
+							  LLVMConstNull(ctx->types[UPLPGSQL_PTR]),
+							  "na.has.nulls");
+
+	load_bb = expr_append_block(ctx, "na.nulls.load");
+	done_bb = expr_append_block(ctx, "na.nulls.done");
+
+	from_bb = LLVMGetInsertBlock(builder);
+	LLVMBuildCondBr(builder, has_nulls, load_bb, done_bb);
+
+	LLVMPositionBuilderAtEnd(builder, load_bb);
+	gep = LLVMBuildGEP2(builder, i8, nulls, &idx0, 1, "na.null.ptr");
+	flag = LLVMBuildLoad2(builder, i8, gep, "na.null.raw");
+	flag = LLVMBuildTrunc(builder, flag, i1, "na.null.flag");
+	LLVMBuildBr(builder, done_bb);
+
+	LLVMPositionBuilderAtEnd(builder, done_bb);
+	phi = LLVMBuildPhi(builder, i1, "na.elem.isnull");
+	vals[0] = LLVMConstInt(i1, 0, false);
+	blocks[0] = from_bb;
+	vals[1] = flag;
+	blocks[1] = load_bb;
+	LLVMAddIncoming(phi, vals, blocks, 2);
+
+	return phi;
+}
+
+/*
  * OR together the isnull flags of every leaf of a Tier 1 expression.
  *
  * Every operator Tier 1 accepts is strict — int4/int8 arithmetic, the
@@ -555,15 +602,51 @@ tier1_expr_any_null(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 		case T_SubscriptingRef:
 			{
 				/*
-				 * A native array read: null if the array variable is null, or
-				 * if the subscript is.  (Out-of-range is a runtime error, not
-				 * a null, so there is nothing more to fold in here.)
+				 * A native array read is NULL when the array or the subscript
+				 * is NULL — and also whenever the subscript is out of range.
+				 *
+				 * PostgreSQL returns NULL for a[i] outside the array's bounds,
+				 * for a[i] on a NULL or empty array, and for a single-subscript
+				 * read of a multi-dimensional array.  All three are runtime
+				 * facts, and this function already returns a runtime i1, so
+				 * folding them in here is what makes them come out as SQL NULL:
+				 * the caller stores NULL whenever this is true.
+				 *
+				 * It also means the value path below is reached only for a
+				 * subscript that is definitely in range, so it needs no bounds
+				 * check of its own.
+				 *
+				 *     len < 0     -> not a 1-D array (from_datum's marker)
+				 *     i < lb      -> below the lower bound
+				 *     i > lb+len-1-> past the end (len 0 catches NULL/empty)
 				 */
 				SubscriptingRef *s = (SubscriptingRef *) expr;
 				LLVMValueRef	acc = NULL;
 				ListCell	   *lc;
+				UPLpgSQL_native_array *na = NULL;
 
-				acc = tier1_expr_any_null(ctx, s->refexpr, estate_ref);
+				if (IsA(s->refexpr, Param) &&
+					list_length(s->refupperindexpr) == 1)
+					na = find_native_array(ctx,
+										   ((Param *) s->refexpr)->paramid - 1);
+
+				/*
+				 * Do NOT ask whether the array variable itself is NULL when it
+				 * is native.
+				 *
+				 * That question goes through uplpgsql_emit_load_param_isnull(),
+				 * which treats reading a native array's variable as a
+				 * whole-datum escape and marshals the entire array back out to
+				 * its Datum first.  In a loop over a[i] that is a full array
+				 * rebuild *per iteration* — it made a 1000-element read loop
+				 * ~100x slower than the interpreter.
+				 *
+				 * It is also unnecessary: from_datum reports len 0 for a NULL
+				 * array, so the range test below already answers NULL for it.
+				 */
+				if (na == NULL)
+					acc = tier1_expr_any_null(ctx, s->refexpr, estate_ref);
+
 				foreach(lc, s->refupperindexpr)
 				{
 					LLVMValueRef v = tier1_expr_any_null(ctx,
@@ -574,6 +657,62 @@ tier1_expr_any_null(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 					acc = (acc == NULL) ? v
 						: LLVMBuildOr(builder, acc, v, "anynull");
 				}
+
+				if (na != NULL)
+				{
+					LLVMTypeRef		i32 = ctx->types[UPLPGSQL_INT32];
+					ExprTypeClass	idx_class;
+					LLVMValueRef	idx, len, lb, oob;
+
+					idx = uplpgsql_compile_expr_datum(ctx,
+						(Expr *) linitial(s->refupperindexpr), estate_ref,
+						&idx_class);
+					if (idx_class == EXPR_TYPE_INT8)
+						idx = LLVMBuildTrunc(builder, idx, i32, "na.idx32");
+
+					len = LLVMBuildLoad2(builder, i32, na->len_ptr, "na.len");
+					lb = LLVMBuildLoad2(builder, i32, na->lb_ptr, "na.lb");
+
+					/* len < 0: not a 1-D array, so a[i] is NULL */
+					oob = LLVMBuildICmp(builder, LLVMIntSLT, len,
+										LLVMConstInt(i32, 0, true),
+										"na.notflat");
+					/* i < lb */
+					oob = LLVMBuildOr(builder, oob,
+						LLVMBuildICmp(builder, LLVMIntSLT, idx, lb,
+									  "na.below"),
+						"na.oob");
+					/* i > lb + len - 1 */
+					oob = LLVMBuildOr(builder, oob,
+						LLVMBuildICmp(builder, LLVMIntSGT, idx,
+							LLVMBuildSub(builder,
+								LLVMBuildAdd(builder, lb, len, "na.end"),
+								LLVMConstInt(i32, 1, false), "na.last"),
+							"na.above"),
+						"na.oob2");
+
+					/*
+					 * ...and, when in range, the element may itself be NULL —
+					 * PostgreSQL leaves NULLs behind when an assignment
+					 * extends an array past its end.  Only meaningful for an
+					 * in-range subscript, but idx0 is harmless otherwise
+					 * because the flags load is guarded and the result is
+					 * OR-ed with oob anyway.
+					 */
+					{
+						LLVMValueRef idx0, elem_null;
+
+						idx0 = LLVMBuildSub(builder, idx, lb, "na.idx0");
+						elem_null = emit_native_array_elem_isnull(ctx, na,
+																  idx0);
+						oob = LLVMBuildOr(builder, oob, elem_null,
+										  "na.oob.or.null");
+					}
+
+					acc = (acc == NULL) ? oob
+						: LLVMBuildOr(builder, acc, oob, "anynull");
+				}
+
 				return acc;
 			}
 
@@ -2027,52 +2166,23 @@ uplpgsql_compile_expr_datum(UPLpgSQL_compile_ctx *ctx, Expr *expr,
 					/*
 					 * Native array subscript read (expression context).
 					 *
-					 * PL/pgSQL arrays are 1-based, so we subtract 1 for
-					 * the 0-based C pointer arithmetic.  The bounds check
-					 * is inlined: the happy path (in-bounds) falls through
-					 * to the GEP+load; the cold path (out-of-bounds) calls
-					 * RT_NATIVE_ARRAY_BOUNDS_CHECK which ereport(ERROR)s,
-					 * followed by LLVMBuildUnreachable so LLVM knows the
-					 * error path never returns.
+					 * No bounds check here: tier1_expr_any_null() folds the
+					 * range test into the caller's NULL test, and the caller
+					 * only branches here when the subscript is in range — so
+					 * an out-of-range read has already become SQL NULL, which
+					 * is what PostgreSQL returns for it.  Emitting a check
+					 * that can never fire would only cost a branch, and the
+					 * old one raised where PostgreSQL does not.
+					 *
+					 * Index relative to the array's lower bound, which need
+					 * not be 1 ('[2:3]={9,10}').
 					 */
-					LLVMValueRef data, len, idx0, gep, result;
-
-					len = LLVMBuildLoad2(builder, i32, na->len_ptr, "na.len");
-
-					/* Inline bounds check: if out of range, call error helper */
-					{
-						LLVMValueRef lo_ok, hi_ok, ok;
-						LLVMBasicBlockRef fail_bb, ok_bb;
-
-						lo_ok = LLVMBuildICmp(builder, LLVMIntSGE, idx_val,
-											  LLVMConstInt(i32, 1, false), "lo_ok");
-						hi_ok = LLVMBuildICmp(builder, LLVMIntSLE, idx_val,
-											  len, "hi_ok");
-						ok = LLVMBuildAnd(builder, lo_ok, hi_ok, "bounds_ok");
-
-						fail_bb = expr_append_block(ctx, "na.bounds_fail");
-						ok_bb = expr_append_block(ctx, "na.bounds_ok");
-
-						LLVMBuildCondBr(builder, ok, ok_bb, fail_bb);
-
-						/* Fail block: call error helper (cold path) */
-						LLVMPositionBuilderAtEnd(builder, fail_bb);
-						{
-							LLVMValueRef args[] = { idx_val, len };
-							LLVMBuildCall2(builder,
-								ctx->rt_fntypes[RT_NATIVE_ARRAY_BOUNDS_CHECK],
-								ctx->rt_funcs[RT_NATIVE_ARRAY_BOUNDS_CHECK],
-								args, 2, "");
-						}
-						LLVMBuildUnreachable(builder);
-
-						LLVMPositionBuilderAtEnd(builder, ok_bb);
-					}
+					LLVMValueRef data, lb, idx0, gep, result;
 
 					data = LLVMBuildLoad2(builder, ctx->types[UPLPGSQL_PTR],
 										  na->data_ptr, "na.data");
-					idx0 = LLVMBuildSub(builder, idx_val,
-										LLVMConstInt(i32, 1, false), "idx0");
+					lb = LLVMBuildLoad2(builder, i32, na->lb_ptr, "na.lb");
+					idx0 = LLVMBuildSub(builder, idx_val, lb, "idx0");
 					gep = LLVMBuildGEP2(builder, na->llvm_elemtype,
 										data, &idx0, 1, "na.elem_ptr");
 					result = LLVMBuildLoad2(builder, na->llvm_elemtype,
@@ -3543,8 +3653,15 @@ uplpgsql_try_compile_assign(UPLpgSQL_compile_ctx *ctx,
 			elog(DEBUG1, "uplpgsql: native array alloc dno %d (elem_size %d): %s",
 				 na->dno, na->elem_size, stmt->expr->query);
 
-			/* Store the length */
+			/*
+			 * Store the length.  array_fill always produces a 1-based array
+			 * with no NULL elements.
+			 */
 			LLVMBuildStore(ctx->builder, n_val, na->len_ptr);
+			LLVMBuildStore(ctx->builder, upl_const_int32(ctx, 1), na->lb_ptr);
+			LLVMBuildStore(ctx->builder,
+						   LLVMConstNull(ctx->types[UPLPGSQL_PTR]),
+						   na->nulls_ptr);
 
 			/* byte_size = (i64)n * elem_size */
 			byte_size = LLVMBuildMul(ctx->builder,
@@ -3733,6 +3850,8 @@ not_native_init:
 					ExprTypeClass	val_class;
 					LLVMValueRef	idx_val, val_result;
 					LLVMValueRef	data, len, idx0, gep;
+					LLVMValueRef	lb, in_range;
+					LLVMBasicBlockRef fast_bb, slow_bb, done_bb;
 					LLVMTypeRef		i32_ty = ctx->types[UPLPGSQL_INT32];
 
 					val_class = uplpgsql_classify_expr(val_expr);
@@ -3749,45 +3868,135 @@ not_native_init:
 															estate_ref,
 															&val_class);
 
+					/*
+					 * A store into flat memory can only serve a subscript
+					 * that is already in range.  PostgreSQL instead *extends*
+					 * the array on an out-of-range assignment — a[6] := 9 on
+					 * a 3-element array yields [1:6], and a[3] := 7 on a NULL
+					 * array yields [3:3] — and raises "wrong number of array
+					 * subscripts" for a single-subscript write to a 2-D value.
+					 * None of that can be done in place.
+					 *
+					 * So: take the fast store when the subscript is in range
+					 * and the value really is a 1-D array, and otherwise hand
+					 * the write to array_set_element via the runtime helper,
+					 * which implements all of the above.  The slow path syncs
+					 * flat memory out to the Datum first (it is the live copy)
+					 * and re-reads the result back in afterwards, so the array
+					 * stays native — an extend just makes it bigger.
+					 *
+					 * The check mirrors the read path in tier1_expr_any_null:
+					 * len < 0 means "not a 1-D array".
+					 */
 					len = LLVMBuildLoad2(ctx->builder, i32_ty,
 										 na->len_ptr, "na.len");
+					lb = LLVMBuildLoad2(ctx->builder, i32_ty,
+										na->lb_ptr, "na.lb");
 
-					/* Inline bounds check */
-					{
-						LLVMValueRef lo_ok, hi_ok, ok;
-						LLVMBasicBlockRef fail_bb, ok_bb;
+					in_range = LLVMBuildICmp(ctx->builder, LLVMIntSGE, len,
+											 LLVMConstInt(i32_ty, 0, true),
+											 "na.flat");
+					in_range = LLVMBuildAnd(ctx->builder, in_range,
+						LLVMBuildICmp(ctx->builder, LLVMIntSGE, idx_val, lb,
+									  "na.ge.lb"),
+						"na.set.lo");
+					in_range = LLVMBuildAnd(ctx->builder, in_range,
+						LLVMBuildICmp(ctx->builder, LLVMIntSLE, idx_val,
+							LLVMBuildSub(ctx->builder,
+								LLVMBuildAdd(ctx->builder, lb, len, "na.end"),
+								LLVMConstInt(i32_ty, 1, false), "na.last"),
+							"na.le.hi"),
+						"na.set.ok");
 
-						lo_ok = LLVMBuildICmp(ctx->builder, LLVMIntSGE,
-							idx_val, LLVMConstInt(i32_ty, 1, false), "lo_ok");
-						hi_ok = LLVMBuildICmp(ctx->builder, LLVMIntSLE,
-							idx_val, len, "hi_ok");
-						ok = LLVMBuildAnd(ctx->builder, lo_ok, hi_ok, "bounds_ok");
+					fast_bb = expr_append_block(ctx, "na.set.fast");
+					slow_bb = expr_append_block(ctx, "na.set.slow");
+					done_bb = expr_append_block(ctx, "na.set.done");
 
-						fail_bb = expr_append_block(ctx, "na.set_fail");
-						ok_bb = expr_append_block(ctx, "na.set_ok");
+					LLVMBuildCondBr(ctx->builder, in_range, fast_bb, slow_bb);
 
-						LLVMBuildCondBr(ctx->builder, ok, ok_bb, fail_bb);
-
-						LLVMPositionBuilderAtEnd(ctx->builder, fail_bb);
-						{
-							LLVMValueRef args[] = { idx_val, len };
-							LLVMBuildCall2(ctx->builder,
-								ctx->rt_fntypes[RT_NATIVE_ARRAY_BOUNDS_CHECK],
-								ctx->rt_funcs[RT_NATIVE_ARRAY_BOUNDS_CHECK],
-								args, 2, "");
-						}
-						LLVMBuildUnreachable(ctx->builder);
-
-						LLVMPositionBuilderAtEnd(ctx->builder, ok_bb);
-					}
-
+					/* In range: store straight into flat memory. */
+					LLVMPositionBuilderAtEnd(ctx->builder, fast_bb);
 					data = LLVMBuildLoad2(ctx->builder, ctx->types[UPLPGSQL_PTR],
 										  na->data_ptr, "na.data");
-					idx0 = LLVMBuildSub(ctx->builder, idx_val,
-										LLVMConstInt(i32_ty, 1, false), "idx0");
+					idx0 = LLVMBuildSub(ctx->builder, idx_val, lb, "idx0");
 					gep = LLVMBuildGEP2(ctx->builder, na->llvm_elemtype,
 										data, &idx0, 1, "na.elem_ptr");
 					LLVMBuildStore(ctx->builder, val_result, gep);
+
+					/*
+					 * The element now has a value, so clear its NULL flag —
+					 * it may have been one of the gap elements a previous
+					 * extend left behind.  Only if flags exist at all; a NULL
+					 * pointer means nothing in the array is NULL.
+					 */
+					{
+						LLVMValueRef		nulls, has;
+						LLVMBasicBlockRef	clr_bb, after_bb;
+
+						nulls = LLVMBuildLoad2(ctx->builder,
+											   ctx->types[UPLPGSQL_PTR],
+											   na->nulls_ptr, "na.nulls");
+						has = LLVMBuildICmp(ctx->builder, LLVMIntNE, nulls,
+											LLVMConstNull(ctx->types[UPLPGSQL_PTR]),
+											"na.has.nulls");
+
+						clr_bb = expr_append_block(ctx, "na.set.clrnull");
+						after_bb = expr_append_block(ctx, "na.set.stored");
+						LLVMBuildCondBr(ctx->builder, has, clr_bb, after_bb);
+
+						LLVMPositionBuilderAtEnd(ctx->builder, clr_bb);
+						{
+							LLVMValueRef ngep;
+
+							ngep = LLVMBuildGEP2(ctx->builder,
+								ctx->types[UPLPGSQL_INT8], nulls, &idx0, 1,
+								"na.null.ptr");
+							LLVMBuildStore(ctx->builder,
+								LLVMConstInt(ctx->types[UPLPGSQL_INT8], 0,
+											 false),
+								ngep);
+						}
+						LLVMBuildBr(ctx->builder, after_bb);
+
+						LLVMPositionBuilderAtEnd(ctx->builder, after_bb);
+					}
+					LLVMBuildBr(ctx->builder, done_bb);
+
+					/* Out of range, or not 1-D: let PostgreSQL do it. */
+					LLVMPositionBuilderAtEnd(ctx->builder, slow_bb);
+					uplpgsql_emit_sync_native_array(ctx, na);
+					{
+						ArrayTypeInfo	ati;
+						LLVMValueRef	datum_val;
+
+						datum_val = native_to_datum(ctx, val_result, val_class);
+						resolve_array_type_info(ctx, array_dno, &ati);
+
+						{
+							LLVMValueRef args[] = {
+								estate_ref,
+								LLVMConstInt(i32_ty, array_dno, false),
+								idx_val,
+								datum_val,
+								LLVMConstInt(ctx->types[UPLPGSQL_INT1], 0,
+											 false),	/* valisnull */
+								ati.typlen_val,
+								ati.elemtype_val,
+								ati.elmlen_val,
+								ati.elmbyval_val,
+								ati.elmalign_val
+							};
+
+							LLVMBuildCall2(ctx->builder,
+								ctx->rt_fntypes[RT_ARRAY_SET_ELEMENT],
+								ctx->rt_funcs[RT_ARRAY_SET_ELEMENT],
+								args, 10, "");
+						}
+					}
+					uplpgsql_emit_refresh_native_array(ctx, na);
+					LLVMBuildBr(ctx->builder, done_bb);
+
+					LLVMPositionBuilderAtEnd(ctx->builder, done_bb);
 					return true;
 				}
 
@@ -3807,6 +4016,8 @@ not_native_init:
 					 *             float8 → bitcast to i64
 					 */
 					LLVMValueRef idx_val, data, len, idx0, gep, elem;
+					LLVMValueRef na_lb;
+					LLVMBasicBlockRef null_bb, val_bb, get_done_bb;
 					LLVMTypeRef  i32_ty = ctx->types[UPLPGSQL_INT32];
 
 					elog(DEBUG1, "uplpgsql: native array get dno %d[idx] -> dno %d: %s",
@@ -3818,40 +4029,51 @@ not_native_init:
 
 					len = LLVMBuildLoad2(ctx->builder, i32_ty,
 										 na->len_ptr, "na.len");
+					na_lb = LLVMBuildLoad2(ctx->builder, i32_ty,
+										   na->lb_ptr, "na.lb");
 
-					/* Inline bounds check */
+					/*
+					 * Out of range reads as SQL NULL, as it does in
+					 * PostgreSQL — a[10] on a 3-element array, a[0], a NULL
+					 * or empty array, or a single subscript on a
+					 * multi-dimensional value (len < 0).  This used to raise.
+					 */
 					{
-						LLVMValueRef lo_ok, hi_ok, ok;
-						LLVMBasicBlockRef fail_bb, ok_bb;
+						LLVMValueRef	oob;
 
-						lo_ok = LLVMBuildICmp(ctx->builder, LLVMIntSGE,
-							idx_val, LLVMConstInt(i32_ty, 1, false), "lo_ok");
-						hi_ok = LLVMBuildICmp(ctx->builder, LLVMIntSLE,
-							idx_val, len, "hi_ok");
-						ok = LLVMBuildAnd(ctx->builder, lo_ok, hi_ok, "bounds_ok");
+						oob = LLVMBuildICmp(ctx->builder, LLVMIntSLT, len,
+											LLVMConstInt(i32_ty, 0, true),
+											"na.notflat");
+						oob = LLVMBuildOr(ctx->builder, oob,
+							LLVMBuildICmp(ctx->builder, LLVMIntSLT, idx_val,
+										  na_lb, "na.below"),
+							"na.oob");
+						oob = LLVMBuildOr(ctx->builder, oob,
+							LLVMBuildICmp(ctx->builder, LLVMIntSGT, idx_val,
+								LLVMBuildSub(ctx->builder,
+									LLVMBuildAdd(ctx->builder, na_lb, len,
+												 "na.end"),
+									LLVMConstInt(i32_ty, 1, false), "na.last"),
+								"na.above"),
+							"na.oob2");
 
-						fail_bb = expr_append_block(ctx, "na.get_fail");
-						ok_bb = expr_append_block(ctx, "na.get_ok");
+						null_bb = expr_append_block(ctx, "na.get.null");
+						val_bb = expr_append_block(ctx, "na.get.val");
+						get_done_bb = expr_append_block(ctx, "na.get.done");
 
-						LLVMBuildCondBr(ctx->builder, ok, ok_bb, fail_bb);
+						LLVMBuildCondBr(ctx->builder, oob, null_bb, val_bb);
 
-						LLVMPositionBuilderAtEnd(ctx->builder, fail_bb);
-						{
-							LLVMValueRef args[] = { idx_val, len };
-							LLVMBuildCall2(ctx->builder,
-								ctx->rt_fntypes[RT_NATIVE_ARRAY_BOUNDS_CHECK],
-								ctx->rt_funcs[RT_NATIVE_ARRAY_BOUNDS_CHECK],
-								args, 2, "");
-						}
-						LLVMBuildUnreachable(ctx->builder);
+						LLVMPositionBuilderAtEnd(ctx->builder, null_bb);
+						uplpgsql_emit_store_var_null(ctx, estate_ref,
+													 stmt->varno);
+						LLVMBuildBr(ctx->builder, get_done_bb);
 
-						LLVMPositionBuilderAtEnd(ctx->builder, ok_bb);
+						LLVMPositionBuilderAtEnd(ctx->builder, val_bb);
 					}
 
 					data = LLVMBuildLoad2(ctx->builder, ctx->types[UPLPGSQL_PTR],
 										  na->data_ptr, "na.data");
-					idx0 = LLVMBuildSub(ctx->builder, idx_val,
-										LLVMConstInt(i32_ty, 1, false), "idx0");
+					idx0 = LLVMBuildSub(ctx->builder, idx_val, na_lb, "idx0");
 					gep = LLVMBuildGEP2(ctx->builder, na->llvm_elemtype,
 										data, &idx0, 1, "na.elem_ptr");
 					elem = LLVMBuildLoad2(ctx->builder, na->llvm_elemtype,
@@ -3873,6 +4095,9 @@ not_native_init:
 						uplpgsql_emit_store_var_datum(ctx, estate_ref,
 													  stmt->varno, datum_val);
 					}
+					LLVMBuildBr(ctx->builder, get_done_bb);
+
+					LLVMPositionBuilderAtEnd(ctx->builder, get_done_bb);
 					return true;
 				}
 

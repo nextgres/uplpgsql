@@ -1496,57 +1496,105 @@ uplpgsql_rt_native_array_alloc(UPLpgSQL_exec_state *estate, int64 byte_size)
 UPLPGSQL_RT_EXPORT void *
 uplpgsql_rt_native_array_from_datum(UPLpgSQL_exec_state *estate,
 									Datum array_datum, bool isnull,
-									int elem_size, int *out_nelems)
+									int elem_size, int *out_nelems,
+									int *out_lb, bool **out_nulls)
 {
 	MemoryContext	oldcxt;
 	ArrayType	   *arr;
 	int				nelems;
 	void		   *result;
 
+	/*
+	 * A NULL array reads as empty: len 0 with lower bound 1 makes every
+	 * subscript out of range, which is what the caller turns into SQL NULL.
+	 */
+	*out_nulls = NULL;
+
 	if (isnull)
 	{
 		*out_nelems = 0;
+		*out_lb = 1;
 		return NULL;
 	}
 
 	arr = DatumGetArrayTypeP(array_datum);
 
 	/*
-	 * The native form is a flat vector: one dimension, lower bound 1, which
-	 * is all uplpgsql_rt_native_array_to_datum() can rebuild (it uses
-	 * construct_array()).  Refuse anything else — multi-dimensional arrays,
-	 * or a non-standard lower bound such as '[2:3]={9,10}' — because taking
-	 * it native would silently flatten it on the way back out.
+	 * The native form is a flat one-dimensional vector.  A multi-dimensional
+	 * value cannot be held in it — and must not be flattened into it, or the
+	 * dimensions are lost on the way back out — so report len -1, the "not a
+	 * 1-D array" marker.  The caller treats that as "every single-subscript
+	 * read is NULL", which is exactly what PostgreSQL says about a[i] on a
+	 * 2-D array, and routes writes to the generic path, which raises "wrong
+	 * number of array subscripts" as it should.
 	 *
-	 * Returning NULL leaves the caller's data_ptr NULL, which is the "not
-	 * native" state: to_datum() then skips the array entirely and the
-	 * variable keeps the real Datum the interpreter maintains.
-	 *
-	 * Also covers ARR_NDIM == 0 (an empty array).
+	 * ARR_NDIM == 0 (an empty array) is a genuine empty 1-D value: len 0.
 	 */
-	if (ARR_NDIM(arr) != 1 || ARR_LBOUND(arr)[0] != 1)
+	if (ARR_NDIM(arr) == 0)
 	{
 		*out_nelems = 0;
+		*out_lb = 1;
 		return NULL;
 	}
 
+	if (ARR_NDIM(arr) != 1)
+	{
+		*out_nelems = -1;
+		*out_lb = 1;
+		return NULL;
+	}
+
+	/*
+	 * A non-standard lower bound is fine: report it and let the caller index
+	 * relative to it.  to_datum() rebuilds with the same bound.
+	 */
 	nelems = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
 	*out_nelems = nelems;
+	*out_lb = ARR_LBOUND(arr)[0];
 
 	if (nelems == 0)
 		return NULL;
 
-	/*
-	 * Native arrays don't support NULLs — if the PG array has a null
-	 * bitmap, we can't just memcpy.  For now, reject arrays with nulls.
-	 */
-	if (ARR_HASNULL(arr))
-		ereport(ERROR,
-				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("native array does not support NULL elements")));
-
 	oldcxt = MemoryContextSwitchTo(estate->uplpgsql_estate->datum_context);
 	result = palloc(nelems * elem_size);
+
+	/*
+	 * An array with NULL elements is still perfectly native — it just needs a
+	 * per-element flag alongside the values, because the flat vector has no
+	 * way to say "absent" on its own.  This is not exotic: extending an array
+	 * past its end (a[6] := 9 on a 3-element array) is defined to fill the gap
+	 * with NULLs, so any array grown that way arrives here with a null bitmap.
+	 *
+	 * The values themselves are *packed*: PostgreSQL stores nothing at all for
+	 * a NULL element, so the source advances only past the ones that are
+	 * present, while the native vector keeps a slot for every element and
+	 * marks the absent ones.  (A set bit in the bitmap means not-null.)
+	 */
+	if (ARR_HASNULL(arr))
+	{
+		uint8	   *bitmap = ARR_NULLBITMAP(arr);
+		bool	   *nulls = (bool *) palloc(nelems * sizeof(bool));
+		char	   *src = ARR_DATA_PTR(arr);
+		int			i;
+
+		for (i = 0; i < nelems; i++)
+		{
+			nulls[i] = ((bitmap[i / 8] & (1 << (i % 8))) == 0);
+
+			if (nulls[i])
+				memset((char *) result + (i * elem_size), 0, elem_size);
+			else
+			{
+				memcpy((char *) result + (i * elem_size), src, elem_size);
+				src += elem_size;
+			}
+		}
+
+		*out_nulls = nulls;
+		MemoryContextSwitchTo(oldcxt);
+		return result;
+	}
+
 	MemoryContextSwitchTo(oldcxt);
 
 	memcpy(result, ARR_DATA_PTR(arr), nelems * elem_size);
@@ -1565,6 +1613,7 @@ uplpgsql_rt_native_array_from_datum(UPLpgSQL_exec_state *estate,
 UPLPGSQL_RT_EXPORT void
 uplpgsql_rt_native_array_to_datum(UPLpgSQL_exec_state *estate,
 								  int varno, void *data, int nelems,
+								  int lb, bool *nulls,
 								  Oid elemtype, int elem_size)
 {
 	UPLpgSQL_execstate *plstate = estate->uplpgsql_estate;
@@ -1595,7 +1644,13 @@ uplpgsql_rt_native_array_to_datum(UPLpgSQL_exec_state *estate,
 			elems[i] = Int64GetDatum(((int64 *) data)[i]);
 	}
 
-	arr = construct_array(elems, nelems, elemtype, typlen, typbyval, typalign);
+	/*
+	 * construct_md_array rather than construct_array: the latter always builds
+	 * a lower bound of 1, which would silently rebase an array declared as
+	 * '[2:3]={9,10}'.
+	 */
+	arr = construct_md_array(elems, nulls, 1, &nelems, &lb,
+							 elemtype, typlen, typbyval, typalign);
 	pfree(elems);
 
 	/* Store into the variable */

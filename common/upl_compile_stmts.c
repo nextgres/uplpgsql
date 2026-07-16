@@ -357,6 +357,24 @@ uplpgsql_setup_entry(UPL_compile_ctx *ctx)
 										  ctx->types[UPLPGSQL_INT32], name);
 			LLVMBuildStore(ctx->builder, llvm_const_int32(ctx, 0),
 						   na->len_ptr);
+
+			/*
+			 * Lower bound.  1 until something says otherwise; from_datum
+			 * reports the real one for an array that has a different base.
+			 */
+			snprintf(name, sizeof(name), "na%d.lb", na->dno);
+			na->lb_ptr = LLVMBuildAlloca(ctx->builder,
+										 ctx->types[UPLPGSQL_INT32], name);
+			LLVMBuildStore(ctx->builder, llvm_const_int32(ctx, 1),
+						   na->lb_ptr);
+
+			/* Per-element NULL flags; NULL pointer means "no element is" */
+			snprintf(name, sizeof(name), "na%d.nulls", na->dno);
+			na->nulls_ptr = LLVMBuildAlloca(ctx->builder,
+											ctx->types[UPLPGSQL_PTR], name);
+			LLVMBuildStore(ctx->builder,
+						   LLVMConstNull(ctx->types[UPLPGSQL_PTR]),
+						   na->nulls_ptr);
 		}
 	}
 }
@@ -1124,6 +1142,8 @@ uplpgsql_analyze_native_arrays(UPLpgSQL_compile_ctx *ctx,
 			na->llvm_elemtype = NULL;
 			na->data_ptr = NULL;
 			na->len_ptr = NULL;
+			na->lb_ptr = NULL;
+			na->nulls_ptr = NULL;
 
 			elog(DEBUG1, "uplpgsql: native array candidate dno %d (%s), "
 				 "elemtype %u, elem_size %d",
@@ -1953,10 +1973,10 @@ uplpgsql_register_runtime_funcs(UPLpgSQL_compile_ctx *ctx)
 			"uplpgsql_rt_native_array_bounds_check", ft);
 	}
 
-	/* ptr uplpgsql_rt_native_array_from_datum(ptr estate, i64 datum, i32 isnull, i32 elem_size, ptr out_nelems) */
+	/* ptr uplpgsql_rt_native_array_from_datum(ptr estate, i64 datum, i32 isnull, i32 elem_size, ptr out_nelems, ptr out_lb) */
 	{
-		LLVMTypeRef params[] = { ptr, i64, i32, i32, ptr };
-		LLVMTypeRef ft = LLVMFunctionType(ptr, params, 5, false);
+		LLVMTypeRef params[] = { ptr, i64, i32, i32, ptr, ptr, ptr };
+		LLVMTypeRef ft = LLVMFunctionType(ptr, params, 7, false);
 
 		ctx->rt_fntypes[RT_NATIVE_ARRAY_FROM_DATUM] = ft;
 		ctx->rt_funcs[RT_NATIVE_ARRAY_FROM_DATUM] = LLVMAddFunction(ctx->module,
@@ -1973,10 +1993,10 @@ uplpgsql_register_runtime_funcs(UPLpgSQL_compile_ctx *ctx)
 			"uplpgsql_rt_free_var_datum", ft);
 	}
 
-	/* void uplpgsql_rt_native_array_to_datum(ptr estate, i32 varno, ptr data, i32 nelems, i32 elemtype, i32 elem_size) */
+	/* void uplpgsql_rt_native_array_to_datum(ptr estate, i32 varno, ptr data, i32 nelems, i32 lb, i32 elemtype, i32 elem_size) */
 	{
-		LLVMTypeRef params[] = { ptr, i32, ptr, i32, i32, i32 };
-		LLVMTypeRef ft = LLVMFunctionType(vd, params, 6, false);
+		LLVMTypeRef params[] = { ptr, i32, ptr, i32, i32, ptr, i32, i32 };
+		LLVMTypeRef ft = LLVMFunctionType(vd, params, 8, false);
 
 		ctx->rt_fntypes[RT_NATIVE_ARRAY_TO_DATUM] = ft;
 		ctx->rt_funcs[RT_NATIVE_ARRAY_TO_DATUM] = LLVMAddFunction(ctx->module,
@@ -2196,25 +2216,30 @@ uplpgsql_emit_sync_native_array(UPLpgSQL_compile_ctx *ctx,
 {
 	LLVMValueRef estate_ref = LLVMGetParam(ctx->function, 0);
 	LLVMTypeRef i32_ty = ctx->types[UPLPGSQL_INT32];
-	LLVMValueRef data, len;
-	LLVMValueRef args[6];
+	LLVMValueRef data, len, lb, nulls;
+	LLVMValueRef args[8];
 
 	data = LLVMBuildLoad2(ctx->builder, ctx->types[UPLPGSQL_PTR],
 						  na->data_ptr, "sync.data");
 	len = LLVMBuildLoad2(ctx->builder, i32_ty,
 						 na->len_ptr, "sync.len");
+	lb = LLVMBuildLoad2(ctx->builder, i32_ty, na->lb_ptr, "sync.lb");
+	nulls = LLVMBuildLoad2(ctx->builder, ctx->types[UPLPGSQL_PTR],
+						   na->nulls_ptr, "sync.nulls");
 
 	args[0] = estate_ref;
 	args[1] = LLVMConstInt(i32_ty, na->dno, false);
 	args[2] = data;
 	args[3] = len;
-	args[4] = LLVMConstInt(i32_ty, na->elemtype, false);
-	args[5] = LLVMConstInt(i32_ty, na->elem_size, false);
+	args[4] = lb;
+	args[5] = nulls;
+	args[6] = LLVMConstInt(i32_ty, na->elemtype, false);
+	args[7] = LLVMConstInt(i32_ty, na->elem_size, false);
 
 	LLVMBuildCall2(ctx->builder,
 		ctx->rt_fntypes[RT_NATIVE_ARRAY_TO_DATUM],
 		ctx->rt_funcs[RT_NATIVE_ARRAY_TO_DATUM],
-		args, 6, "");
+		args, 8, "");
 }
 
 static void
@@ -2258,12 +2283,16 @@ uplpgsql_emit_refresh_native_array(UPLpgSQL_compile_ctx *ctx,
 {
 	LLVMValueRef estate_ref = LLVMGetParam(ctx->function, 0);
 	LLVMTypeRef	 i32_ty = ctx->types[UPLPGSQL_INT32];
-	LLVMValueRef datum_val, isnull_val, new_data, new_len, nelems_ptr;
+	LLVMValueRef datum_val, isnull_val, new_data, new_len, new_lb;
+	LLVMValueRef nelems_ptr, lb_ptr, nulls_out_ptr, new_nulls;
 
 	datum_val = upl_emit_load_var_datum(ctx, estate_ref, na->dno);
 	isnull_val = upl_emit_load_var_isnull(ctx, estate_ref, na->dno);
 
 	nelems_ptr = LLVMBuildAlloca(ctx->builder, i32_ty, "na_nelems");
+	lb_ptr = LLVMBuildAlloca(ctx->builder, i32_ty, "na_lb");
+	nulls_out_ptr = LLVMBuildAlloca(ctx->builder, ctx->types[UPLPGSQL_PTR],
+									"na_nulls_out");
 	isnull_val = LLVMBuildZExt(ctx->builder, isnull_val, i32_ty, "isnull_i32");
 
 	{
@@ -2272,18 +2301,25 @@ uplpgsql_emit_refresh_native_array(UPLpgSQL_compile_ctx *ctx,
 			datum_val,
 			isnull_val,
 			LLVMConstInt(i32_ty, na->elem_size, false),
-			nelems_ptr
+			nelems_ptr,
+			lb_ptr,
+			nulls_out_ptr
 		};
 
 		new_data = LLVMBuildCall2(ctx->builder,
 			ctx->rt_fntypes[RT_NATIVE_ARRAY_FROM_DATUM],
 			ctx->rt_funcs[RT_NATIVE_ARRAY_FROM_DATUM],
-			call_args, 5, "na.from_datum");
+			call_args, 7, "na.from_datum");
 	}
 
 	LLVMBuildStore(ctx->builder, new_data, na->data_ptr);
 	new_len = LLVMBuildLoad2(ctx->builder, i32_ty, nelems_ptr, "na.new_len");
 	LLVMBuildStore(ctx->builder, new_len, na->len_ptr);
+	new_lb = LLVMBuildLoad2(ctx->builder, i32_ty, lb_ptr, "na.new_lb");
+	LLVMBuildStore(ctx->builder, new_lb, na->lb_ptr);
+	new_nulls = LLVMBuildLoad2(ctx->builder, ctx->types[UPLPGSQL_PTR],
+							   nulls_out_ptr, "na.new_nulls");
+	LLVMBuildStore(ctx->builder, new_nulls, na->nulls_ptr);
 }
 
 static void

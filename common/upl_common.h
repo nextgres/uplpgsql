@@ -273,7 +273,20 @@ typedef struct UPLpgSQL_native_array
 	int				elem_size;		/* sizeof(element): 4 or 8 bytes */
 	LLVMTypeRef		llvm_elemtype;	/* i32, i64, or double */
 	LLVMValueRef	data_ptr;		/* entry-block alloca holding ptr to flat memory */
-	LLVMValueRef	len_ptr;		/* entry-block alloca holding element count (i32) */
+	LLVMValueRef	len_ptr;		/* entry-block alloca: element count, or -1 when
+									 * the value is not a 1-D array and so cannot be
+									 * held natively (see uplpgsql_rt_native_array_
+									 * from_datum) */
+	LLVMValueRef	nulls_ptr;		/* entry-block alloca: ptr to a per-element
+									 * bool array, or NULL when no element is
+									 * NULL.  PostgreSQL fills the gap with NULLs
+									 * when an assignment extends an array past
+									 * its end, so the native form has to be able
+									 * to say which elements are null. */
+	LLVMValueRef	lb_ptr;			/* entry-block alloca: the array's lower bound.
+									 * PostgreSQL arrays need not start at 1
+									 * ('[2:3]={9,10}'), so subscripts are relative
+									 * to this, not to 1. */
 } UPLpgSQL_native_array;
 
 /*
@@ -465,10 +478,12 @@ extern void uplpgsql_rt_free_var_datum(UPLpgSQL_exec_state *estate, int dno);
 /* Decompose PG array Datum into flat native memory */
 extern void *uplpgsql_rt_native_array_from_datum(UPLpgSQL_exec_state *estate,
 												 Datum array_datum, bool isnull,
-												 int elem_size, int *out_nelems);
+												 int elem_size, int *out_nelems,
+												 int *out_lb, bool **out_nulls);
 /* Marshal native flat array to PG array Datum in variable */
 extern void uplpgsql_rt_native_array_to_datum(UPLpgSQL_exec_state *estate,
 											  int varno, void *data, int nelems,
+											  int lb, bool *nulls,
 											  Oid elemtype, int elem_size);
 
 #endif							/* UPL_COMMON_H */
